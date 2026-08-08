@@ -1,6 +1,6 @@
 {
   "name": "@questorylabs/qhttp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Fluent, extensible HTTP + WebSocket client",
   "license": "MIT",
   "type": "module",
@@ -38,6 +38,27 @@
       "types": "./dist/http-cache.d.ts",
       "import": "./dist/http-cache.js",
       "require": "./dist/http-cache.cjs"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.js",
+      "require": "./dist/react.cjs"
+    }
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "ws": "^8.0.0",
+    "http-cache-semantics": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "ws": {
+      "optional": true
+    },
+    "http-cache-semantics": {
+      "optional": true
     }
   },
   "scripts": {
@@ -50,24 +71,17 @@
     "bench:compare": "vitest bench test/bench/compare.bench.ts",
     "size": "size-limit"
   },
-  "peerDependencies": {
-    "ws": "^8.0.0",
-    "http-cache-semantics": "^4.0.0"
-  },
-  "peerDependenciesMeta": {
-    "ws": {
-      "optional": true
-    },
-    "http-cache-semantics": {
-      "optional": true
-    }
-  },
   "devDependencies": {
     "@size-limit/file": "^11.1.6",
     "@types/http-cache-semantics": "^4.2.0",
     "@types/node": "^22.10.2",
     "@vitest/coverage-v8": "^2.1.8",
+    "@testing-library/react": "^16.3.0",
+    "@types/react": "^19.2.0",
     "http-cache-semantics": "^4.2.0",
+    "jsdom": "^26.1.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
     "size-limit": "^11.1.6",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",

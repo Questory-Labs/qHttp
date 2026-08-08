@@ -172,6 +172,25 @@ describe('response parsing', () => {
     expect(data).toEqual({ ok: true });
   });
 
+  it('reads content-type via duck-typed Headers.get', async () => {
+    const headers = {
+      get: (name: string) => (name === 'content-type' ? 'application/json' : null),
+    };
+    const response = {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers,
+      body: null,
+      arrayBuffer: async () => new ArrayBuffer(0),
+      json: async () => ({ ok: true }),
+      text: async () => '{"ok":true}',
+      blob: async () => new Blob(),
+    };
+    const data = await parseResponseBody(response, 'auto');
+    expect(data).toEqual({ ok: true });
+  });
+
   it('parses text response type', async () => {
     const response = {
       ok: true,

@@ -123,15 +123,21 @@ export async function readResponseWithProgress(
   return combined.buffer;
 }
 
+function readContentType(headers: Headers | Record<string, string>): string {
+  if (headers && typeof (headers as Headers).get === 'function') {
+    const value = (headers as Headers).get('content-type');
+    if (value) return value;
+  }
+  const record = headers as Record<string, string>;
+  return record['content-type'] ?? record['Content-Type'] ?? '';
+}
+
 export async function parseResponseBody<T>(
   response: RawResponseLike,
   responseType: ResponseType,
   bufferedBody?: ArrayBuffer | null,
 ): Promise<T> {
-  const contentType =
-    response.headers instanceof Headers
-      ? response.headers.get('content-type') ?? ''
-      : response.headers['content-type'] ?? '';
+  const contentType = readContentType(response.headers);
 
   const effectiveType =
     responseType === 'auto' ? sniffResponseType(contentType, response.status) : responseType;
