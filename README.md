@@ -2,7 +2,7 @@
 
 > Fluent, extensible HTTP + WebSocket client for Node, browsers, and edge runtimes.
 
-**~8 KB gzip** · MIT · Node ≥ 20 · ESM + CJS
+MIT · Node ≥ 20 · ESM + CJS
 
 ---
 

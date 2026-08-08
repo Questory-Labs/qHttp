@@ -4,7 +4,10 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    include: ['test/**/*.spec.ts'],
+    include: ['test/**/*.spec.ts', 'test/**/*.spec.tsx'],
+    environmentMatchGlobs: [
+      ['test/react/**', 'jsdom'],
+    ],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary'],
