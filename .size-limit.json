@@ -1,0 +1,20 @@
+[
+  {
+    "name": "core",
+    "path": "dist/index.js",
+    "limit": "20 KB",
+    "gzip": true
+  },
+  {
+    "name": "ws",
+    "path": "dist/ws.js",
+    "limit": "10 KB",
+    "gzip": true
+  },
+  {
+    "name": "http2",
+    "path": "dist/http2.js",
+    "limit": "5 KB",
+    "gzip": true
+  }
+]

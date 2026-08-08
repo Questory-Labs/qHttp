@@ -1,0 +1,76 @@
+{
+  "name": "@questorylabs/qhttp",
+  "version": "0.1.0",
+  "description": "Fluent, extensible HTTP + WebSocket client",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./ws": {
+      "types": "./dist/ws.d.ts",
+      "import": "./dist/ws.js",
+      "require": "./dist/ws.cjs"
+    },
+    "./http2": {
+      "types": "./dist/http2.d.ts",
+      "import": "./dist/http2.js",
+      "require": "./dist/http2.cjs"
+    },
+    "./http-cache": {
+      "types": "./dist/http-cache.d.ts",
+      "import": "./dist/http-cache.js",
+      "require": "./dist/http-cache.cjs"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "bench": "vitest bench test/bench",
+    "bench:hot": "vitest bench test/bench/hot-path.bench.ts",
+    "bench:compare": "vitest bench test/bench/compare.bench.ts",
+    "size": "size-limit"
+  },
+  "peerDependencies": {
+    "ws": "^8.0.0",
+    "http-cache-semantics": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    },
+    "http-cache-semantics": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@size-limit/file": "^11.1.6",
+    "@types/http-cache-semantics": "^4.2.0",
+    "@types/node": "^22.10.2",
+    "@vitest/coverage-v8": "^2.1.8",
+    "http-cache-semantics": "^4.2.0",
+    "size-limit": "^11.1.6",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
