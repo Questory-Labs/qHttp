@@ -1,17 +1,30 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
 import { loadFromRequest } from '../resource/load-from-request.js';
+import type { LoadOpts, UseResourceOptions } from '../resource/types.js';
 import { useStore } from './context.js';
-import type { UseResourceOptions } from '../resource/types.js';
+import { shouldRefreshOnFocus } from './focus-refresh.js';
+import { RefreshScheduler } from './refresh-scheduler.js';
 
-function resolveRefreshEvery<T>(
-  interval: UseResourceOptions<T>['refreshEvery'],
+function resolveInterval<T>(
+  refreshEvery: UseResourceOptions<T>['refreshEvery'],
   value: T | undefined,
 ): number | false {
-  if (interval === false || interval === undefined) return false;
-  if (typeof interval === 'function') return interval(value);
-  return interval;
+  if (refreshEvery === false || refreshEvery === undefined) return false;
+  if (typeof refreshEvery === 'function') return refreshEvery(value);
+  return refreshEvery;
+}
+
+function toLoadOpts<T>(options: UseResourceOptions<T>): LoadOpts {
+  return {
+    freshFor: options.freshFor,
+    retries: options.retries,
+    retryDelay: options.retryDelay,
+    backoff: options.backoff,
+    maxDelay: options.maxDelay,
+    jitter: options.jitter,
+  };
 }
 
 export function useResource<T>(options: UseResourceOptions<T>) {
@@ -20,13 +33,12 @@ export function useResource<T>(options: UseResourceOptions<T>) {
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
-  const load = useMemo(() => {
-    if (options.load) return options.load;
-    if (options.request) return loadFromRequest<T>(options.request);
-    return undefined;
-  }, [options.load, options.request]);
-
   const idStr = JSON.stringify(options.id);
+  const refreshEveryDep =
+    typeof options.refreshEvery === 'function'
+      ? 'fn'
+      : (options.refreshEvery ?? false);
+  const refreshOnFocus = Boolean(options.refreshOnFocus);
 
   const subscribe = useCallback(
     (onStoreChange: () => void) => store.observe(options.id, onStoreChange),
@@ -34,7 +46,6 @@ export function useResource<T>(options: UseResourceOptions<T>) {
   );
 
   const snapRef = useRef(store.snapshot<T>(options.id));
-
   const getSnapshot = useCallback(() => {
     const next = store.snapshot<T>(options.id);
     const prev = snapRef.current;
@@ -53,64 +64,94 @@ export function useResource<T>(options: UseResourceOptions<T>) {
   }, [store, idStr]);
 
   const snap = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  const intervalOpt = options.refreshEvery;
-  const intervalDep =
-    typeof intervalOpt === 'function' ? 'fn' : (intervalOpt ?? false);
+  const schedulerRef = useRef<RefreshScheduler | null>(null);
+  const lastFocusAtRef = useRef(0);
+
+  const resolveLoad = (): (() => Promise<T>) | undefined => {
+    const current = optionsRef.current;
+    if (current.load) return current.load;
+    if (current.request) return loadFromRequest<T>(current.request);
+    return undefined;
+  };
 
   const reload = useCallback(async () => {
-    if (!when || !load) return snap.value;
-    return store.ensure(optionsRef.current.id, load, {
-      freshFor: optionsRef.current.freshFor,
-      retries: optionsRef.current.retries,
-    });
-  }, [store, when, load, snap.value]);
+    if (!when) return snap.value;
+    const load = resolveLoad();
+    if (!load) return snap.value;
+    return store.reload(
+      optionsRef.current.id,
+      load,
+      toLoadOpts(optionsRef.current),
+    );
+  }, [store, when, snap.value]);
 
-  useEffect(() => {
-    if (!when || !load) return;
-    void store
-      .ensure(optionsRef.current.id, load, {
-        freshFor: optionsRef.current.freshFor,
-        retries: optionsRef.current.retries,
-      })
-      .catch(() => undefined);
-  }, [store, when, idStr, load]);
-
+  // Load once per id. Do not depend on `load` identity — callers use inline lambdas.
   useEffect(() => {
     if (!when) return;
+    const load = resolveLoad();
+    if (!load) return;
+    void store
+      .ensure(optionsRef.current.id, load, toLoadOpts(optionsRef.current))
+      .catch(() => undefined);
+  }, [store, when, idStr]);
 
-    let timer: ReturnType<typeof setInterval> | undefined;
-    let lastMs: number | false | undefined;
+  useEffect(() => {
+    if (!when || refreshEveryDep === false) {
+      schedulerRef.current?.dispose();
+      schedulerRef.current = null;
+      return;
+    }
 
-    const schedule = () => {
-      const value = store.peek<T>(optionsRef.current.id);
-      const ms = resolveRefreshEvery(optionsRef.current.refreshEvery, value);
-      if (ms === lastMs) return;
-      lastMs = ms;
-      if (timer) clearInterval(timer);
-      timer = undefined;
-      if (ms === false || ms <= 0) return;
-      timer = setInterval(() => {
-        void store.reload(optionsRef.current.id).catch(() => undefined);
-      }, ms);
-    };
-
-    schedule();
-    const unsub = store.observe(optionsRef.current.id, schedule);
+    const scheduler = new RefreshScheduler({
+      getInterval: () =>
+        resolveInterval(
+          optionsRef.current.refreshEvery,
+          store.peek<T>(optionsRef.current.id),
+        ),
+      refresh: () => store.reload(optionsRef.current.id),
+    });
+    schedulerRef.current = scheduler;
+    scheduler.sync();
+    const unsub = store.observe(optionsRef.current.id, () => scheduler.sync());
 
     return () => {
       unsub();
-      if (timer) clearInterval(timer);
+      scheduler.dispose();
+      if (schedulerRef.current === scheduler) schedulerRef.current = null;
     };
-  }, [store, when, idStr, intervalDep]);
+  }, [store, when, idStr, refreshEveryDep]);
 
   useEffect(() => {
-    if (!when || !optionsRef.current.refreshOnFocus) return;
-    const onFocus = () => {
-      void store.reload(optionsRef.current.id).catch(() => undefined);
+    if (!when || !refreshOnFocus) return;
+
+    const onVisible = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
+      const current = optionsRef.current;
+      const now = Date.now();
+      if (
+        !shouldRefreshOnFocus({
+          snapshot: store.snapshot(current.id),
+          freshFor: current.freshFor ?? store.getDefaults().freshFor ?? 0,
+          now,
+          lastAttemptAt: lastFocusAtRef.current,
+        })
+      ) {
+        return;
+      }
+      lastFocusAtRef.current = now;
+      schedulerRef.current?.resume();
+      void store.reload(current.id).catch(() => undefined);
     };
-    window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
-  }, [store, when, idStr]);
+
+    window.addEventListener('focus', onVisible);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.removeEventListener('focus', onVisible);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [store, when, idStr, refreshOnFocus]);
 
   return {
     ...snap,

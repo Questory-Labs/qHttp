@@ -180,7 +180,11 @@ new QWebSocket(url, { queueLimit?: number })
 
 ### `@questorylabs/qhttp`
 
-`QHttp`, `FetchAdapter`, `defaultFetchAdapter`, `MemoryCacheEngine`, `LocalStorageCacheEngine`, `configureDefaultCacheEngine`, `getDefaultCacheEngine`, `resetDefaultCacheEngine`, `buildCacheKey`, `buildCacheKeyFromContext`, `resolveMacros`, `findUnresolvedMacros`, `serializeParams`, `joinUrl`, `QHttpError`, `isQHttpError`, `HookManager`, types.
+`QHttp`, adapters/cache helpers, `ResourceStore`, `applyAuth` / `createAuthPreRequestHook` / `toBase64`, `QHttpError`, `HookManager`, store + core types.
+
+### `@questorylabs/qhttp/react`
+
+`ResourceProvider`, `useStore`, `useResource`, `useAction`, `useLiveResource`, plus `ResourceStore` and resource types.
 
 ### `@questorylabs/qhttp/ws`
 
@@ -189,3 +193,7 @@ new QWebSocket(url, { queueLimit?: number })
 ### `@questorylabs/qhttp/http2`
 
 `Http2Adapter`.
+
+### `@questorylabs/qhttp/http-cache`
+
+HTTP-cache policy helpers (optional `http-cache-semantics` peer).

@@ -75,7 +75,7 @@ try {
 | `MISSING_URL_MACRO` | Unresolved `{{macro}}` |
 | `UNSERIALIZABLE_PARAM` | Query param could not serialize |
 | `BODY_NOT_ALLOWED` | Body on GET/HEAD |
-| `BODY_NOT_REPLAYABLE` | Stream body with retry |
+| `BODY_NOT_REPLAYABLE` | *(reserved)* Stream bodies skip retry and run once — not thrown today |
 | `INVALID_CONFIG` | Invalid client configuration |
 
 ## validateStatus
@@ -122,3 +122,30 @@ client.cancel();
 3. **Log in `onRetry`** — correlate attempt count with upstream outages.
 4. **Combine with `onError`** for graceful degradation after retries exhaust.
 5. **Inspect `error.result`** on HTTP errors — body may be parsed before status validation failed.
+
+## ResourceStore / useResource
+
+Load retries and poll backoff are **separate** from HTTP `setRetry`:
+
+| Layer | API | Default | Purpose |
+|-------|-----|---------|---------|
+| HTTP | `client.setRetry({ retries })` | off | Transport / status retries |
+| Resource load | `retries` on `ensure` / `useResource` | **off** (`false`) | Extra attempts around `load()` |
+| Polling | `refreshEvery` | off | Interval refresh; backs off and stops after 5 failures |
+
+Prefer **one** retry owner. If `sessionHttp` already retries, keep resource `retries: false` (the default).
+
+```typescript
+// HTTP owns retries
+const http = new QHttp().setRetry({ retries: 2, backoff: 'exponential', jitter: true });
+
+useResource({
+  id: ['me'],
+  load: () => http.get('/auth/me').then((r) => r.data),
+  // retries omitted → false
+  refreshEvery: 30_000, // poll backs off / stops on repeated failure
+  refreshOnFocus: true,  // only if stale or errored; 60s cooldown
+});
+```
+
+`refreshOnFocus` uses `visibilitychange` + `focus`, skips fresh data within `freshFor`, and applies a 60s cooldown between focus-driven reloads.

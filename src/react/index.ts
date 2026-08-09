@@ -8,6 +8,7 @@ export { serializeResourceId, idsMatchPrefix } from '../resource/resource-id.js'
 export type {
   ResourceId,
   ResourceDefaults,
+  ResourceRetryOptions,
   ResourceSnapshot,
   LoadOpts,
   UseResourceOptions,
@@ -15,3 +16,4 @@ export type {
   UseLiveResourceOptions,
   LiveSubscribe,
 } from '../resource/types.js';
+

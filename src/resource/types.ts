@@ -1,15 +1,26 @@
 import type { QHttp } from '../core/QHttp.js';
+import type { BackoffStrategy } from '../core/types.js';
 
 export type ResourceId = readonly unknown[];
 
-export type ResourceDefaults = {
-  freshFor?: number;
+export type ResourceRetryOptions = {
+  /**
+   * Retries after the first failed `load()` attempt.
+   * Default `false` (one attempt) — prefer `QHttp.setRetry` for HTTP transport.
+   */
   retries?: number | false;
+  retryDelay?: number;
+  backoff?: BackoffStrategy;
+  maxDelay?: number;
+  jitter?: boolean;
 };
 
-export type LoadOpts = {
+export type ResourceDefaults = ResourceRetryOptions & {
   freshFor?: number;
-  retries?: number | false;
+};
+
+export type LoadOpts = ResourceRetryOptions & {
+  freshFor?: number;
 };
 
 export type ResourceSnapshot<T> = {
@@ -21,14 +32,13 @@ export type ResourceSnapshot<T> = {
   updatedAt: number;
 };
 
-export type UseResourceOptions<T> = {
+export type UseResourceOptions<T> = ResourceRetryOptions & {
   id: ResourceId;
   load?: () => Promise<T>;
   /** Preconfigured QHttp client — runs GET and maps QHttpError to Error. */
   request?: QHttp;
   when?: boolean;
   freshFor?: number;
-  retries?: number | false;
   refreshEvery?:
     | number
     | false

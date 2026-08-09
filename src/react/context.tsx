@@ -3,6 +3,7 @@
 import {
   createContext,
   useContext,
+  useEffect,
   useState,
   type ReactNode,
 } from 'react';
@@ -25,10 +26,12 @@ export function ResourceProvider({
   client,
   defaults,
 }: ResourceProviderProps) {
-  const [owned] = useState(
-    () => new ResourceStore(defaults),
-  );
+  const [owned] = useState(() => new ResourceStore(defaults));
   const resourceStore = store ?? client ?? owned;
+
+  useEffect(() => {
+    if (defaults) resourceStore.configureDefaults(defaults);
+  }, [resourceStore, defaults]);
 
   return (
     <ResourceStoreContext.Provider value={resourceStore}>

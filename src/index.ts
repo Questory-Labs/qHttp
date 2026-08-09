@@ -43,16 +43,15 @@ export { joinUrl } from './utils/url.js';
 export { QHttpError, isQHttpError } from './errors/qhttp-error.js';
 export type { QHttpErrorCode } from './errors/qhttp-error.js';
 export { HookManager } from './interceptors/hook-manager.js';
+export { applyAuth, createAuthPreRequestHook, toBase64 } from './auth/auth.js';
 export { ResourceStore } from './resource/resource-store.js';
 export { loadFromRequest } from './resource/load-from-request.js';
 export { serializeResourceId, idsMatchPrefix } from './resource/resource-id.js';
 export type {
   ResourceId,
   ResourceDefaults,
+  ResourceRetryOptions,
   ResourceSnapshot,
   LoadOpts,
-  UseResourceOptions,
-  UseActionOptions,
-  UseLiveResourceOptions,
-  LiveSubscribe,
 } from './resource/types.js';
+
