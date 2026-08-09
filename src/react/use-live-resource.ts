@@ -16,9 +16,14 @@ export function useLiveResource<T>(options: UseLiveResourceOptions<T>) {
   const resource = useResource({
     id: options.id,
     load: options.load,
+    request: options.request,
     when: options.when,
     freshFor: options.freshFor,
     retries: options.retries,
+    retryDelay: options.retryDelay,
+    backoff: options.backoff,
+    maxDelay: options.maxDelay,
+    jitter: options.jitter,
   });
 
   const idStr = JSON.stringify(options.id);
@@ -26,24 +31,15 @@ export function useLiveResource<T>(options: UseLiveResourceOptions<T>) {
 
   useEffect(() => {
     if (!when) return;
-
     const ac = new AbortController();
-
-    void subscribeRef.current(
-      (raw) => {
-        try {
-          const data = parseRef.current(raw) as T;
-          store.push(options.id, data);
-        } catch {
-          // ignore malformed frames
-        }
-      },
-      ac.signal,
-    );
-
-    return () => {
-      ac.abort();
-    };
+    void subscribeRef.current((raw) => {
+      try {
+        store.push(options.id, parseRef.current(raw) as T);
+      } catch {
+        // ignore malformed frames
+      }
+    }, ac.signal);
+    return () => ac.abort();
   }, [store, when, idStr, options.id]);
 
   return resource;

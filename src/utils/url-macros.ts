@@ -26,10 +26,6 @@ export function resolveMacros(
   return resolved;
 }
 
-export function hasUnresolvedMacros(value: string): boolean {
-  return MACRO_PATTERN.test(value);
-}
-
 export function findUnresolvedMacros(value: string): string[] {
   const unresolved: string[] = [];
   const pattern = new RegExp(MACRO_PATTERN.source, 'g');
@@ -38,4 +34,8 @@ export function findUnresolvedMacros(value: string): string[] {
     unresolved.push(match[1]!);
   }
   return unresolved;
+}
+
+export function hasUnresolvedMacros(value: string): boolean {
+  return findUnresolvedMacros(value).length > 0;
 }

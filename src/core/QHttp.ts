@@ -14,7 +14,7 @@ import {
   configureDefaultCacheEngine,
   getDefaultCacheEngine,
 } from '../cache/default-cache-engine.js';
-import type { CacheEngine } from '../cache/cache-engine.interface.js';
+import type { CacheEngine } from '../core/types.js';
 import { LocalStorageCacheEngine } from '../cache/local-storage-cache-engine.js';
 import {
   assertProgressCompatible,
@@ -64,7 +64,6 @@ export class QHttp {
   #fetchStatus = createFetchStatusManager();
   #activeController?: ComposedSignal;
   #progressHandler?: (event: ProgressEvent) => void;
-  #explicitCacheEngine = false;
 
   constructor(config: QHttpConfig = {}) {
     this.#config = {
@@ -178,7 +177,6 @@ export class QHttp {
 
   cacheEngine(engine: CacheEngine): this {
     this.#config.cacheEngine = engine;
-    this.#explicitCacheEngine = true;
     return this;
   }
 
@@ -274,7 +272,6 @@ export class QHttp {
     const copy = new QHttp({ ...this.#config, headers: { ...this.#config.headers } });
     copy.#hooks = this.#hooks.clone();
     copy.#progressHandler = this.#progressHandler;
-    copy.#explicitCacheEngine = this.#explicitCacheEngine;
     return copy;
   }
 
@@ -443,9 +440,27 @@ export class QHttp {
     const adapter = this.#config.adapter ?? defaultFetchAdapter;
     const retryOptions = withDefaults(this.#config.retry);
 
+    // Cancel/user signal for the whole request (including retry backoff sleeps).
+    const cancelGate = new AbortController();
+    const onExternalAbort = () => {
+      if (!cancelGate.signal.aborted) cancelGate.abort();
+    };
+    if (this.#config.signal) {
+      if (this.#config.signal.aborted) onExternalAbort();
+      else this.#config.signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+
+    const requestScope: ComposedSignal = {
+      signal: cancelGate.signal,
+      cancel: () => onExternalAbort(),
+      cleanup: () => {
+        this.#config.signal?.removeEventListener('abort', onExternalAbort);
+      },
+    };
+    this.#activeController = requestScope;
+
     const runAttempt = async (): Promise<QHttpResult<T>> => {
-      const composed = composeSignal(this.#config.signal, ctx.timeout);
-      this.#activeController = composed;
+      const composed = composeSignal(cancelGate.signal, ctx.timeout);
       ctx.signal = composed.signal;
 
       try {
@@ -567,26 +582,32 @@ export class QHttp {
         return result;
       } finally {
         composed.cleanup();
-        this.#activeController = undefined;
       }
     };
 
-    if (retryOptions) {
-      if (!isReplayableBody(ctx.body)) {
-        return runAttempt();
+    try {
+      if (retryOptions) {
+        if (!isReplayableBody(ctx.body)) {
+          return await runAttempt();
+        }
+
+        return await withRetry(runAttempt, {
+          ...retryOptions,
+          method: ctx.method,
+          signal: cancelGate.signal,
+          onRetry: async (attempt, error) => {
+            await this.#hooks.run('onRetry', { attempt, error });
+          },
+        });
       }
 
-      return withRetry(runAttempt, {
-        ...retryOptions,
-        method: ctx.method,
-        signal: this.#config.signal,
-        onRetry: async (attempt, error) => {
-          await this.#hooks.run('onRetry', { attempt, error });
-        },
-      });
+      return await runAttempt();
+    } finally {
+      requestScope.cleanup();
+      if (this.#activeController === requestScope) {
+        this.#activeController = undefined;
+      }
     }
-
-    return runAttempt();
   }
 
   #isHttpCacheMode(): boolean {

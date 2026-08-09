@@ -4,6 +4,7 @@ import type { FinalRequest, HttpAdapter, RawResponseLike } from '../core/types.j
 
 interface Http2ClientRequest {
   end: (body?: Buffer | string) => void;
+  close?: () => void;
   on: (event: string, listener: (...args: unknown[]) => void) => void;
 }
 
@@ -57,6 +58,10 @@ export class Http2Adapter implements HttpAdapter {
   #http2Module: Http2Module | null = null;
 
   async send(request: FinalRequest): Promise<RawResponseLike> {
+    if (request.signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
     const url = new URL(request.url);
     const origin = `${url.protocol}//${url.host}`;
     const session = await this.#getSession(origin);
@@ -74,7 +79,28 @@ export class Http2Adapter implements HttpAdapter {
       const req = session.request(headers);
       const chunks: Buffer[] = [];
       let status = 0;
+      let settled = false;
       const responseHeaders: Record<string, string> = {};
+
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        request.signal?.removeEventListener('abort', onAbort);
+        fn();
+      };
+
+      const onAbort = () => {
+        try {
+          req.close?.();
+        } catch {
+          // ignore close errors on abort
+        }
+        settle(() => reject(new DOMException('Aborted', 'AbortError')));
+      };
+
+      if (request.signal) {
+        request.signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       req.on('response', ((responseHeadersRaw: Record<string, string | string[]>) => {
         status = Number(responseHeadersRaw[':status'] ?? 0);
@@ -84,7 +110,6 @@ export class Http2Adapter implements HttpAdapter {
         }
       }) as (...args: unknown[]) => void);
 
-      // Keep raw Buffers — never setEncoding('binary') (that yields latin1 strings).
       req.on('data', ((chunk: unknown) => {
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
       }) as (...args: unknown[]) => void);
@@ -100,27 +125,31 @@ export class Http2Adapter implements HttpAdapter {
             })
           : null;
 
-        resolve({
-          ok: status >= 200 && status < 300,
-          status,
-          statusText: '',
-          headers: responseHeaders,
-          body,
-          arrayBuffer: async () => {
-            const copy = bodyBuffer.buffer.slice(
-              bodyBuffer.byteOffset,
-              bodyBuffer.byteOffset + bodyBuffer.byteLength,
-            );
-            return copy;
-          },
-          json: async () => JSON.parse(bodyBuffer.toString('utf-8')),
-          text: async () => bodyBuffer.toString('utf-8'),
-          blob: async () => new Blob([bodyBuffer]),
-        });
+        settle(() =>
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            statusText: '',
+            headers: responseHeaders,
+            body,
+            arrayBuffer: async () => {
+              const copy = bodyBuffer.buffer.slice(
+                bodyBuffer.byteOffset,
+                bodyBuffer.byteOffset + bodyBuffer.byteLength,
+              );
+              return copy;
+            },
+            json: async () => JSON.parse(bodyBuffer.toString('utf-8')),
+            text: async () => bodyBuffer.toString('utf-8'),
+            blob: async () => new Blob([bodyBuffer]),
+          }),
+        );
       });
 
       req.on('error', ((error: unknown) => {
-        reject(error instanceof Error ? error : new Error(String(error)));
+        settle(() =>
+          reject(error instanceof Error ? error : new Error(String(error))),
+        );
       }) as (...args: unknown[]) => void);
 
       if (bodyPayload !== undefined) {

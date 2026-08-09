@@ -42,10 +42,7 @@ describe('ResourceStore', () => {
 
   it('touch marks stale and refetches observed resources', async () => {
     const store = new ResourceStore();
-    const fn = vi
-      .fn()
-      .mockResolvedValueOnce(1)
-      .mockResolvedValueOnce(2);
+    const fn = vi.fn().mockResolvedValueOnce(1).mockResolvedValueOnce(2);
 
     await store.ensure(['x'], fn, { freshFor: 60_000 });
     store.touch(['x']);
@@ -56,12 +53,8 @@ describe('ResourceStore', () => {
 
   it('touch refetches observed resources', async () => {
     const store = new ResourceStore();
-    const fn = vi
-      .fn()
-      .mockResolvedValueOnce('a')
-      .mockResolvedValueOnce('b');
-    const listener = vi.fn();
-    store.observe(['obs'], listener);
+    const fn = vi.fn().mockResolvedValueOnce('a').mockResolvedValueOnce('b');
+    store.observe(['obs'], vi.fn());
 
     await store.ensure(['obs'], fn, { freshFor: 60_000 });
     store.touch(['obs']);
@@ -89,16 +82,98 @@ describe('ResourceStore', () => {
     expect(fnB).toHaveBeenCalledTimes(1);
   });
 
-  it('retries failed loads', async () => {
+  it('does not retry by default', async () => {
+    const store = new ResourceStore();
+    const fn = vi.fn().mockRejectedValue(new Error('fail'));
+
+    await expect(store.ensure(['default'], fn)).rejects.toThrow('fail');
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries failed loads when configured', async () => {
     const store = new ResourceStore();
     const fn = vi
       .fn()
       .mockRejectedValueOnce(new Error('fail'))
       .mockResolvedValueOnce('ok');
 
-    const data = await store.ensure(['retry'], fn, { retries: 1 });
+    const data = await store.ensure(['retry'], fn, {
+      retries: 1,
+      jitter: false,
+      retryDelay: 1,
+    });
     expect(data).toBe('ok');
     expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry when retries is false', async () => {
+    const store = new ResourceStore();
+    const fn = vi.fn().mockRejectedValue(new Error('fail'));
+
+    await expect(
+      store.ensure(['no-retry'], fn, { retries: false }),
+    ).rejects.toThrow('fail');
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('delays between resource retries', async () => {
+    vi.useFakeTimers();
+    const store = new ResourceStore();
+    const fn = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('fail'))
+      .mockResolvedValueOnce('ok');
+
+    const promise = store.ensure(['retry-delay'], fn, {
+      retries: 1,
+      retryDelay: 500,
+      backoff: 'exponential',
+      jitter: false,
+    });
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(fn).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await promise;
+    expect(fn).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it('throws after exhausting retries', async () => {
+    const store = new ResourceStore();
+    const fn = vi.fn().mockRejectedValue(new Error('fail'));
+
+    await expect(
+      store.ensure(['max'], fn, { retries: 2, jitter: false, retryDelay: 1 }),
+    ).rejects.toThrow('fail');
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it('ignores stale in-flight results after reload', async () => {
+    const store = new ResourceStore();
+    let resolveFirst!: (v: string) => void;
+    let resolveSecond!: (v: string) => void;
+
+    const first = new Promise<string>((r) => {
+      resolveFirst = r;
+    });
+    const second = new Promise<string>((r) => {
+      resolveSecond = r;
+    });
+
+    const fn = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second);
+
+    const p1 = store.ensure(['race'], fn);
+    const p2 = store.reload(['race']);
+
+    resolveSecond('new');
+    await expect(p2).resolves.toBe('new');
+    expect(store.peek(['race'])).toBe('new');
+
+    resolveFirst('old');
+    await expect(p1).resolves.toBe('old');
+    expect(store.peek(['race'])).toBe('new');
   });
 
   it('notifies observers', async () => {

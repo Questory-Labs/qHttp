@@ -52,14 +52,9 @@ export async function withRetry<T>(
 
       await options.onRetry?.(attempt, error);
 
-      const base =
-        options.backoff === 'exponential'
-          ? options.retryDelay * 2 ** (attempt - 1)
-          : options.retryDelay;
-      const jittered = applyJitter(base, options.jitter);
       const retryAfter = retryAfterMs(error);
       const delay = Math.min(
-        retryAfter ?? jittered,
+        retryAfter ?? computeRetryDelay(attempt, options),
         options.maxDelay,
       );
 
@@ -85,6 +80,17 @@ export function isRetryableDefault(error: unknown, method: HttpMethod): boolean 
   }
 
   return false;
+}
+
+export function computeRetryDelay(
+  attempt: number,
+  options: Pick<RetryExecutionOptions, 'retryDelay' | 'backoff' | 'jitter'>,
+): number {
+  const base =
+    options.backoff === 'exponential'
+      ? options.retryDelay * 2 ** (attempt - 1)
+      : options.retryDelay;
+  return applyJitter(base, options.jitter);
 }
 
 function applyJitter(delay: number, enabled: boolean): number {

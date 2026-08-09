@@ -1,6 +1,6 @@
 {
   "name": "@questorylabs/qhttp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Fluent, extensible HTTP + WebSocket client",
   "license": "MIT",
   "type": "module",

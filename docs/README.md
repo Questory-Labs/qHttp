@@ -10,11 +10,15 @@ Welcome to the qHttp docs. These guides explain how to build requests, wire hook
 | [Requests](./requests.md) | URLs, query params, bodies, response types, timeouts |
 | [Caching](./caching.md) | Engines, TTL, keys, conditional cache, static API |
 | [Hooks](./hooks.md) | Interceptors, transformation, error recovery |
-| [Retry & errors](./retry-and-errors.md) | Retry policies, `QHttpError`, `throwOnError` |
+| [Retry & errors](./retry-and-errors.md) | Retry policies, `QHttpError`, resource/poll backoff |
 | [Authentication](./authentication.md) | Bearer and Basic credentials |
 | [Adapters](./adapters.md) | Fetch, HTTP/2, custom transports |
 | [WebSockets](./websockets.md) | `QWebSocket`, reconnect, Node `ws` |
 | [API reference](./api-reference.md) | Quick method and type lookup |
+
+### React entry (`@questorylabs/qhttp/react`)
+
+`ResourceProvider`, `useResource`, `useAction`, `useLiveResource`, `useStore`, `ResourceStore` — shared cache with optional `refreshEvery` poll backoff and `refreshOnFocus`. See [Retry & errors](./retry-and-errors.md#resourcestore--useresource).
 
 ## Design principles
 
