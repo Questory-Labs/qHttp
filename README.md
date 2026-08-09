@@ -39,6 +39,43 @@ pnpm add http-cache-semantics # RFC 9111 HTTP cache mode
 | `@questorylabs/qhttp/ws`         | `QWebSocket`, browser/Node WS adapters      |
 | `@questorylabs/qhttp/http2`      | `Http2Adapter` (Node only)                  |
 | `@questorylabs/qhttp/http-cache` | HTTP cache policy helpers                   |
+| `@questorylabs/qhttp/react`      | `ResourceStore`, `useResource`, `useAction`, `useLiveResource` |
+
+
+### React resource layer (`@questorylabs/qhttp/react`)
+
+Framework-agnostic `ResourceStore` plus thin React bindings — not a TanStack Query clone.
+
+```tsx
+import { ResourceProvider, useResource, useAction, useStore } from '@questorylabs/qhttp/react';
+
+function App() {
+  return (
+    <ResourceProvider defaults={{ freshFor: 30_000, retries: 1 }}>
+      <Dashboard />
+    </ResourceProvider>
+  );
+}
+
+function Dashboard() {
+  const stats = useResource({
+    id: ['dashboard'],
+    load: () => fetch('/api/stats').then((r) => r.json()),
+    refreshEvery: 30_000,
+  });
+
+  const save = useAction({
+    run: (name: string) => fetch('/api/profile', { method: 'PATCH', body: name }),
+    touches: [['me'], ['dashboard']],
+  });
+
+  if (stats.empty) return <p>Loading…</p>;
+  return <pre>{JSON.stringify(stats.value)}</pre>;
+}
+```
+
+Resource results expose `value`, `empty`, `busy`, `refreshing`, `failed`, `ready`, and `reload()`.
+Live SSE/WebSocket feeds use `useLiveResource` with an injected `subscribe` callback.
 
 
 ---

@@ -43,15 +43,16 @@ export { joinUrl } from './utils/url.js';
 export { QHttpError, isQHttpError } from './errors/qhttp-error.js';
 export type { QHttpErrorCode } from './errors/qhttp-error.js';
 export { HookManager } from './interceptors/hook-manager.js';
-export { QueryCache } from './query/query-cache.js';
-export { serializeQueryKey, keysMatchPrefix } from './query/query-key.js';
+export { ResourceStore } from './resource/resource-store.js';
+export { loadFromRequest } from './resource/load-from-request.js';
+export { serializeResourceId, idsMatchPrefix } from './resource/resource-id.js';
 export type {
-  QueryKey,
-  QueryStatus,
-  QueryState,
-  FetchQueryOptions,
-  InvalidateFilter,
-  QueryClientDefaults,
-  UseQueryOptions,
-  UseMutationOptions,
-} from './query/types.js';
+  ResourceId,
+  ResourceDefaults,
+  ResourceSnapshot,
+  LoadOpts,
+  UseResourceOptions,
+  UseActionOptions,
+  UseLiveResourceOptions,
+  LiveSubscribe,
+} from './resource/types.js';
