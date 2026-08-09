@@ -3,55 +3,44 @@
 import {
   createContext,
   useContext,
-  useEffect,
-  useRef,
   useState,
   type ReactNode,
 } from 'react';
-import { QueryCache } from '../query/query-cache.js';
-import type { QueryClientDefaults } from '../query/types.js';
+import { ResourceStore } from '../resource/resource-store.js';
+import type { ResourceDefaults } from '../resource/types.js';
 
-export type QHttpQueryProviderProps = {
+export type ResourceProviderProps = {
   children: ReactNode;
-  client?: QueryCache;
-  defaultOptions?: {
-    queries?: QueryClientDefaults;
-  };
+  store?: ResourceStore;
+  /** @deprecated use `store` */
+  client?: ResourceStore;
+  defaults?: ResourceDefaults;
 };
 
-const QueryCacheContext = createContext<QueryCache | null>(null);
+const ResourceStoreContext = createContext<ResourceStore | null>(null);
 
-export function QHttpQueryProvider({
+export function ResourceProvider({
   children,
+  store,
   client,
-  defaultOptions,
-}: QHttpQueryProviderProps) {
+  defaults,
+}: ResourceProviderProps) {
   const [owned] = useState(
-    () =>
-      new QueryCache(
-        defaultOptions?.queries
-          ? { defaultOptions: { queries: defaultOptions.queries } }
-          : undefined,
-      ),
+    () => new ResourceStore(defaults),
   );
-  const cache = client ?? owned;
-  const defaultsApplied = useRef(false);
-
-  useEffect(() => {
-    if (defaultsApplied.current || !defaultOptions?.queries) return;
-    cache.configureDefaults(defaultOptions.queries);
-    defaultsApplied.current = true;
-  }, [cache, defaultOptions]);
+  const resourceStore = store ?? client ?? owned;
 
   return (
-    <QueryCacheContext.Provider value={cache}>{children}</QueryCacheContext.Provider>
+    <ResourceStoreContext.Provider value={resourceStore}>
+      {children}
+    </ResourceStoreContext.Provider>
   );
 }
 
-export function useQueryCache(): QueryCache {
-  const cache = useContext(QueryCacheContext);
-  if (!cache) {
-    throw new Error('useQueryCache must be used within QHttpQueryProvider');
+export function useStore(): ResourceStore {
+  const store = useContext(ResourceStoreContext);
+  if (!store) {
+    throw new Error('useStore must be used within ResourceProvider');
   }
-  return cache;
+  return store;
 }
