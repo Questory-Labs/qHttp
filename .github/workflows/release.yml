@@ -5,59 +5,38 @@ on:
     branches: [release]
 
 permissions:
-  contents: write
+  id-token: write # Required for OIDC trusted publishing
+  contents: write # Required to create the release tag
 
 jobs:
   test:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
-          cache: pnpm
+          node-version: '24'
+          package-manager-cache: false
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test:coverage
 
-  build:
+  publish:
     runs-on: self-hosted
     needs: test
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - run: pnpm size
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-          if-no-files-found: error
-
-  publish:
-    runs-on: self-hosted
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
-          cache: pnpm
+          node-version: '24'
           registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
+          package-manager-cache: false
       - run: pnpm install --frozen-lockfile
+      - run: pnpm build
       - name: Resolve package version
         id: version
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
@@ -74,13 +53,25 @@ jobs:
           fi
       - name: Publish to npm
         if: steps.tag.outputs.exists == 'false'
-        run: pnpm publish --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish # OIDC trusted publishing — no NPM_TOKEN
+      - name: Expose tag for next job
+        id: out
+        run: |
+          echo "tag=${{ steps.tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "published=${{ steps.tag.outputs.exists == 'false' }}" >> "$GITHUB_OUTPUT"
+    outputs:
+      tag: ${{ steps.out.outputs.tag }}
+      published: ${{ steps.out.outputs.published }}
+
+  tag:
+    runs-on: self-hosted
+    needs: publish
+    if: needs.publish.outputs.published == 'true'
+    steps:
+      - uses: actions/checkout@v6
       - name: Create and push git tag
-        if: steps.tag.outputs.exists == 'false'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.tag.outputs.tag }}"
-          git push origin "${{ steps.tag.outputs.tag }}"
+          git tag "${{ needs.publish.outputs.tag }}"
+          git push origin "${{ needs.publish.outputs.tag }}"
