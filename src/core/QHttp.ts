@@ -1,69 +1,75 @@
-import { applyAuth } from '../auth/auth.js';
 import { defaultFetchAdapter } from '../adapters/fetch-adapter.js';
-import { buildCacheKey } from '../cache/cache-key.js';
-import {
-  applyRevalidationHeaders,
-  createHttpCacheEntry,
-  hydrateHttpCacheResult,
-  isHttpCacheEntry,
-  lookupHttpCacheEntry,
-  processRevalidationResponse,
-  type HttpRevalidationContext,
-} from '../cache/http-cache-policy.js';
 import {
   configureDefaultCacheEngine,
   getDefaultCacheEngine,
 } from '../cache/default-cache-engine.js';
-import type { CacheEngine } from '../core/types.js';
-import { LocalStorageCacheEngine } from '../cache/local-storage-cache-engine.js';
-import {
-  assertProgressCompatible,
-  isBinaryResponseType,
-  isReplayableBody,
-  parseResponseBody,
-  readResponseWithProgress,
-  toFinalRequest,
-} from './body.js';
+import { assertProgressCompatible, toRequestSummary } from './body.js';
 import { buildRequestContext } from './build-request.js';
 import { createFetchStatusManager } from './fetch-status.js';
+import { createPaginator, type PaginateOptions, type Paginator } from './paginate.js';
+import { asTerminal, compose } from './pipeline.js';
+import { timingFor } from './result.js';
 import { HookManager } from '../interceptors/hook-manager.js';
+import { createAuthMiddleware } from '../middleware/auth.js';
+import { createCacheMiddleware } from '../middleware/cache.js';
+import { createDedupeMiddleware } from '../middleware/dedupe.js';
+import { CircuitBreaker, RateLimiter, createRateLimitMiddleware } from '../middleware/rate-limit.js';
+import { createRetryMiddleware } from '../middleware/retry.js';
+import { timeoutMiddleware } from '../middleware/timeout.js';
+import { abortErrorFor, createTransport } from '../middleware/transport.js';
 import { contextToConfig, isAbortError, isQHttpError, QHttpError } from '../errors/qhttp-error.js';
-import { withRetry, withDefaults } from '../retry/retry.js';
 import type {
   AuthConfig,
-  CacheSnapshot,
+  CacheEngine,
+  CircuitBreakerLike,
+  CircuitBreakerOptions,
   ErrorHook,
+  FetchOptions,
   FetchStatus,
-  FinalRequest,
   HeadersInit,
   HttpAdapter,
-  HttpMethod,
   HttpCacheOptions,
+  HttpMethod,
+  Middleware,
   PostRequestHook,
   PreRequestHook,
   ProgressEvent,
   QHttpConfig,
   QHttpResult,
   QueryParams,
+  RateLimiterLike,
+  RateLimitOptions,
   RequestBody,
   RequestContext,
+  RequestOptions,
+  ResponseParser,
   ResponseType,
   RetryHook,
   RetryOptions,
   StateChangeHandler,
 } from './types.js';
-import { composeSignal, type ComposedSignal } from '../utils/abortable.js';
-import { recordToHeaders } from '../utils/headers.js';
+import { composeSignal, readAbortReason, type ComposedSignal } from '../utils/abortable.js';
 import { mergeQueryParams } from '../utils/query.js';
 
-const DEFAULT_CACHE_METHODS: HttpMethod[] = ['GET', 'HEAD'];
+export type RequestCall<T = unknown> = RequestOptions<T> & { method?: HttpMethod };
 
+/** Errors that describe a received response rather than a failed transport. */
+const RESPONSE_ERRORS = new Set(['HTTP_ERROR', 'PARSE_ERROR', 'VALIDATION_ERROR']);
+
+/**
+ * HTTP client. Instance setters configure defaults; every call may pass
+ * per-request options that override them without mutating the instance, so
+ * one client can serve concurrent callers safely.
+ */
 export class QHttp {
   #config: QHttpConfig;
   #hooks = new HookManager();
+  #middleware: Middleware[] = [];
   #fetchStatus = createFetchStatusManager();
-  #activeController?: ComposedSignal;
   #progressHandler?: (event: ProgressEvent) => void;
+  #active = new Set<ComposedSignal>();
+  #inflight = new Map<string, Promise<QHttpResult>>();
+  #refreshState: { pending?: Promise<string | void> } = {};
 
   constructor(config: QHttpConfig = {}) {
     this.#config = {
@@ -72,7 +78,11 @@ export class QHttp {
       responseType: 'auto',
       ...config,
     };
+    if (config.rateLimit) this.rateLimit(config.rateLimit);
+    if (config.circuitBreaker) this.circuitBreaker(config.circuitBreaker);
   }
+
+  // ---------------------------------------------------------------- statics
 
   static configureDefaultCacheEngine(engine: CacheEngine): void {
     configureDefaultCacheEngine(engine);
@@ -101,9 +111,23 @@ export class QHttp {
     await getDefaultCacheEngine().clear();
   }
 
+  // ------------------------------------------------------------- properties
+
+  /** Status of the most recent transition. In-flight count is `inFlight`. */
   get fetchStatus(): FetchStatus {
     return this.#fetchStatus.status;
   }
+
+  get inFlight(): number {
+    return this.#active.size;
+  }
+
+  /** Read-only view of the resolved configuration. */
+  get config(): Readonly<QHttpConfig> {
+    return this.#config;
+  }
+
+  // ---------------------------------------------------------------- setters
 
   setBaseUrl(baseUrl: string): this {
     this.#config.baseUrl = baseUrl;
@@ -145,6 +169,12 @@ export class QHttp {
     return this;
   }
 
+  /** Total time budget across retries. */
+  setDeadline(deadline: number): this {
+    this.#config.deadline = deadline;
+    return this;
+  }
+
   setResponseType(responseType: ResponseType): this {
     this.#config.responseType = responseType;
     return this;
@@ -152,6 +182,47 @@ export class QHttp {
 
   setRetry(options: RetryOptions): this {
     this.#config.retry = options;
+    return this;
+  }
+
+  /** Fetch init passthrough: `credentials`, `cache`, `redirect`, `keepalive`, `dispatcher`... */
+  setFetchOptions(options: FetchOptions): this {
+    this.#config.fetchOptions = { ...this.#config.fetchOptions, ...options };
+    return this;
+  }
+
+  /** Validate / transform every successful response body (Standard Schema or function). */
+  parse<T>(parser: ResponseParser<T>): this {
+    this.#config.parse = parser as ResponseParser;
+    return this;
+  }
+
+  /** Share one in-flight response between identical concurrent safe requests. */
+  dedupe(enabled = true): this {
+    this.#config.dedupe = enabled;
+    return this;
+  }
+
+  rateLimit(options: RateLimitOptions | RateLimiterLike | false): this {
+    if (options === false) {
+      this.#config.rateLimit = undefined;
+    } else {
+      this.#config.rateLimit = isLimiter(options) ? options : new RateLimiter(options);
+    }
+    return this;
+  }
+
+  circuitBreaker(options: CircuitBreakerOptions | CircuitBreakerLike | false): this {
+    if (options === false) {
+      this.#config.circuitBreaker = undefined;
+    } else {
+      this.#config.circuitBreaker = isBreaker(options) ? options : new CircuitBreaker(options);
+    }
+    return this;
+  }
+
+  setMeta(meta: Record<string, unknown>): this {
+    this.#config.meta = { ...this.#config.meta, ...meta };
     return this;
   }
 
@@ -195,8 +266,16 @@ export class QHttp {
     return this;
   }
 
+  /** Request headers hashed into the default cache key. Default `['authorization']`. */
+  cacheVary(headers: string[]): this {
+    this.#config.cacheVary = headers;
+    return this;
+  }
+
   getCacheEngine(): CacheEngine | undefined {
-    return this.#resolveCacheEngine();
+    if (this.#config.cacheEngine) return this.#config.cacheEngine;
+    if (this.#config.cache) return getDefaultCacheEngine();
+    return undefined;
   }
 
   setAuth(auth: AuthConfig): this {
@@ -234,6 +313,8 @@ export class QHttp {
     return this;
   }
 
+  // ------------------------------------------------------- hooks/middleware
+
   preRequest(fn: PreRequestHook): this {
     this.#hooks.add('preRequest', fn as (ctx: unknown) => unknown);
     return this;
@@ -259,8 +340,20 @@ export class QHttp {
     return this;
   }
 
+  /**
+   * Add middleware. User middleware runs outermost: after `preRequest` hooks,
+   * before auth, cache, dedupe, retry, timeout, rate limiting and transport.
+   */
+  use(middleware: Middleware): this {
+    this.#middleware.push(middleware);
+    return this;
+  }
+
+  // ------------------------------------------------------------- lifecycle
+
+  /** Abort every in-flight request started from this instance. */
   cancel(): void {
-    this.#activeController?.cancel();
+    for (const scope of this.#active) scope.cancel();
   }
 
   reset(): this {
@@ -269,134 +362,117 @@ export class QHttp {
   }
 
   clone(): QHttp {
-    const copy = new QHttp({ ...this.#config, headers: { ...this.#config.headers } });
+    const copy = new QHttp({
+      ...this.#config,
+      headers: { ...this.#config.headers },
+      queryParams: { ...this.#config.queryParams },
+      urlMacros: { ...this.#config.urlMacros },
+      fetchOptions: this.#config.fetchOptions ? { ...this.#config.fetchOptions } : undefined,
+      meta: this.#config.meta ? { ...this.#config.meta } : undefined,
+    });
     copy.#hooks = this.#hooks.clone();
+    copy.#middleware = [...this.#middleware];
     copy.#progressHandler = this.#progressHandler;
+    copy.#inflight = this.#inflight;
+    copy.#refreshState = this.#refreshState;
     return copy;
   }
 
-  get<T = unknown>(url?: string): Promise<QHttpResult<T>> {
-    return this.request<T>({ method: 'GET', url });
+  // ----------------------------------------------------------------- verbs
+
+  get<T = unknown>(url?: string, options?: RequestOptions<T>): Promise<QHttpResult<T>> {
+    return this.request<T>({ ...options, method: 'GET', url: options?.url ?? url });
   }
 
-  post<T = unknown>(url?: string): Promise<QHttpResult<T>> {
-    return this.request<T>({ method: 'POST', url });
+  post<T = unknown>(url?: string, options?: RequestOptions<T>): Promise<QHttpResult<T>> {
+    return this.request<T>({ ...options, method: 'POST', url: options?.url ?? url });
   }
 
-  put<T = unknown>(url?: string): Promise<QHttpResult<T>> {
-    return this.request<T>({ method: 'PUT', url });
+  put<T = unknown>(url?: string, options?: RequestOptions<T>): Promise<QHttpResult<T>> {
+    return this.request<T>({ ...options, method: 'PUT', url: options?.url ?? url });
   }
 
-  patch<T = unknown>(url?: string): Promise<QHttpResult<T>> {
-    return this.request<T>({ method: 'PATCH', url });
+  patch<T = unknown>(url?: string, options?: RequestOptions<T>): Promise<QHttpResult<T>> {
+    return this.request<T>({ ...options, method: 'PATCH', url: options?.url ?? url });
   }
 
-  delete<T = unknown>(url?: string): Promise<QHttpResult<T>> {
-    return this.request<T>({ method: 'DELETE', url });
+  delete<T = unknown>(url?: string, options?: RequestOptions<T>): Promise<QHttpResult<T>> {
+    return this.request<T>({ ...options, method: 'DELETE', url: options?.url ?? url });
   }
 
-  head<T = unknown>(url?: string): Promise<QHttpResult<T>> {
-    return this.request<T>({ method: 'HEAD', url });
+  head<T = unknown>(url?: string, options?: RequestOptions<T>): Promise<QHttpResult<T>> {
+    return this.request<T>({ ...options, method: 'HEAD', url: options?.url ?? url });
   }
 
-  options<T = unknown>(url?: string): Promise<QHttpResult<T>> {
-    return this.request<T>({ method: 'OPTIONS', url });
+  options<T = unknown>(url?: string, options?: RequestOptions<T>): Promise<QHttpResult<T>> {
+    return this.request<T>({ ...options, method: 'OPTIONS', url: options?.url ?? url });
   }
 
-  async request<T = unknown>(overrides: {
-    method?: HttpMethod;
-    url?: string;
-  } = {}): Promise<QHttpResult<T>> {
-    const method = overrides.method ?? this.#config.method ?? 'GET';
-    const responseType = this.#config.responseType ?? 'auto';
-    assertProgressCompatible(responseType, !!this.#progressHandler);
+  /** Iterate pages. See `pageParam`, `cursorParam`, `linkHeader` helpers. */
+  paginate<T = unknown>(options: PaginateOptions<T>): Paginator<T> {
+    return createPaginator<T>((opts) => this.request<T>(opts), options);
+  }
 
+  async request<T = unknown>(call: RequestCall<T> = {}): Promise<QHttpResult<T>> {
+    const { method: methodOverride, url: urlOverride, ...options } = call;
+    const method = methodOverride ?? this.#config.method ?? 'GET';
+    const onProgress = options.onProgress ?? this.#progressHandler;
+    const responseType = options.responseType ?? this.#config.responseType ?? 'auto';
+    assertProgressCompatible(responseType, !!onProgress);
+
+    const callOptions: RequestOptions = { ...(options as RequestOptions), onProgress };
     let ctx = buildRequestContext({
       config: this.#config,
       method,
-      urlOverride: overrides.url,
+      urlOverride,
+      options: callOptions,
     });
-
-    if (this.#config.auth) {
-      applyAuth(ctx, this.#config.auth);
-    }
 
     ctx = await this.#hooks.run('preRequest', ctx);
 
-    const cacheEnabled = this.#isCacheEnabled(method);
-    const cacheEngine = cacheEnabled ? this.#resolveCacheEngine() : undefined;
-    const cacheKey = cacheEnabled ? buildCacheKey(ctx, this.#config) : undefined;
-    let httpRevalidate: HttpRevalidationContext | undefined;
-
-    if (cacheEnabled && cacheEngine && cacheKey) {
-      await this.#hooks.run('preCache', ctx);
-      const shouldRead = this.#config.cacheWhen?.(ctx) ?? true;
-      if (shouldRead) {
-        const stored = await cacheEngine.get(cacheKey);
-
-        if (this.#isHttpCacheMode() && isHttpCacheEntry(stored)) {
-          const lookup = await lookupHttpCacheEntry(stored, ctx, this.#config.httpCache);
-
-          if (lookup.action === 'hit') {
-            const cachedResult = hydrateHttpCacheResult<T>(
-              lookup.entry,
-              lookup.headers,
-              ctx,
-              this.#progressHandler,
-            );
-            this.#fetchStatus.set('success', { result: cachedResult });
-            const payload = await this.#hooks.run('postRequest', {
-              result: cachedResult,
-              ctx,
-            });
-            return payload.result as QHttpResult<T>;
-          }
-
-          if (lookup.action === 'swr') {
-            const cachedResult = hydrateHttpCacheResult<T>(
-              lookup.entry,
-              lookup.headers,
-              ctx,
-              this.#progressHandler,
-            );
-            void this.#runBackgroundRevalidation(ctx, cacheEngine, cacheKey, lookup);
-            this.#fetchStatus.set('success', { result: cachedResult });
-            const payload = await this.#hooks.run('postRequest', {
-              result: cachedResult,
-              ctx,
-            });
-            return payload.result as QHttpResult<T>;
-          }
-
-          if (lookup.action === 'revalidate') {
-            applyRevalidationHeaders(ctx, lookup.revalidationHeaders);
-            httpRevalidate = {
-              entry: lookup.entry,
-              policy: lookup.policy,
-            };
-          }
-        } else if (!this.#isHttpCacheMode() && stored) {
-          const snapshot = stored as CacheSnapshot;
-          const cachedResult = this.#hydrateFromSnapshot<T>(snapshot, ctx);
-          this.#fetchStatus.set('success', { result: cachedResult });
-          const payload = await this.#hooks.run('postRequest', {
-            result: cachedResult,
-            ctx,
-          });
-          return payload.result as QHttpResult<T>;
-        }
-      }
-    }
-
+    const scope = composeSignal(ctx.signal, {
+      timeoutMs: ctx.deadline,
+      timeoutReason: 'DEADLINE',
+    });
+    ctx.signal = scope.signal;
+    this.#active.add(scope);
     this.#fetchStatus.set('loading');
 
+    const throwOnError = options.throwOnError ?? this.#config.throwOnError;
+    const chain = compose([
+      ...this.#middleware,
+      createAuthMiddleware({
+        refreshState: this.#refreshState,
+        onToken: (token) => {
+          const auth = this.#config.auth;
+          if (auth?.type === 'bearer') this.#config.auth = { ...auth, token };
+        },
+      }),
+      createCacheMiddleware({ config: this.#config, options: callOptions, hooks: this.#hooks }),
+      createDedupeMiddleware({
+        enabled: callOptions.dedupe ?? this.#config.dedupe ?? false,
+        inflight: this.#inflight,
+        vary: this.#config.cacheVary,
+      }),
+      createRetryMiddleware({
+        retry: callOptions.retry === undefined ? this.#config.retry : callOptions.retry,
+        hooks: this.#hooks,
+      }),
+      timeoutMiddleware,
+      createRateLimitMiddleware({
+        limiter: this.#config.rateLimit as RateLimiterLike | undefined,
+        breaker: this.#config.circuitBreaker as CircuitBreakerLike | undefined,
+      }),
+    ]);
+    const transport = asTerminal(createTransport(this.#config.adapter ?? defaultFetchAdapter));
+
     try {
-      const result = await this.#executeRequest<T>(ctx, cacheEngine, cacheKey, httpRevalidate);
+      const result = (await chain(ctx, transport)) as QHttpResult<T>;
       this.#fetchStatus.set('success', { result });
       const payload = await this.#hooks.run('postRequest', { result, ctx });
       return payload.result as QHttpResult<T>;
     } catch (error) {
-      const qError = this.#normalizeError(error, ctx);
+      const qError = this.#normalizeError(error, ctx, scope);
       const recovered = await this.#runErrorHooks(qError);
       if (recovered) {
         this.#fetchStatus.set('success', { result: recovered });
@@ -405,293 +481,43 @@ export class QHttp {
 
       this.#fetchStatus.set('error', { error: qError });
 
-      if (this.#config.throwOnError === false) {
-        const failedResult: QHttpResult<T> = {
-          data: undefined as T,
-          httpStatus: qError.httpStatus ?? 0,
-          statusText: qError.message,
-          headers: {},
-          ok: false,
-          request: toFinalRequest(
-            ctx.resolvedUrl,
-            ctx.method,
-            ctx.headers,
-            ctx.body,
-            ctx.signal,
-            this.#progressHandler,
-          ),
-          fetchStatus: 'error',
-          fromCache: false,
-          error: qError,
-        };
-        return failedResult;
+      if (throwOnError === false) {
+        return this.#failedResult<T>(qError, ctx);
       }
 
       throw qError;
-    }
-  }
-
-  async #executeRequest<T>(
-    ctx: RequestContext,
-    cacheEngine?: CacheEngine,
-    cacheKey?: string,
-    httpRevalidate?: HttpRevalidationContext,
-  ): Promise<QHttpResult<T>> {
-    const adapter = this.#config.adapter ?? defaultFetchAdapter;
-    const retryOptions = withDefaults(this.#config.retry);
-
-    // Cancel/user signal for the whole request (including retry backoff sleeps).
-    const cancelGate = new AbortController();
-    const onExternalAbort = () => {
-      if (!cancelGate.signal.aborted) cancelGate.abort();
-    };
-    if (this.#config.signal) {
-      if (this.#config.signal.aborted) onExternalAbort();
-      else this.#config.signal.addEventListener('abort', onExternalAbort, { once: true });
-    }
-
-    const requestScope: ComposedSignal = {
-      signal: cancelGate.signal,
-      cancel: () => onExternalAbort(),
-      cleanup: () => {
-        this.#config.signal?.removeEventListener('abort', onExternalAbort);
-      },
-    };
-    this.#activeController = requestScope;
-
-    const runAttempt = async (): Promise<QHttpResult<T>> => {
-      const composed = composeSignal(cancelGate.signal, ctx.timeout);
-      ctx.signal = composed.signal;
-
-      try {
-        const finalRequest = toFinalRequest(
-          ctx.resolvedUrl,
-          ctx.method,
-          ctx.headers,
-          ctx.body,
-          composed.signal,
-          this.#progressHandler,
-        );
-
-        let rawResponse: Awaited<ReturnType<HttpAdapter['send']>>;
-        try {
-          rawResponse = await adapter.send(finalRequest);
-        } catch (cause) {
-          throw this.#createTransportError(cause, composed, ctx, finalRequest);
-        }
-
-        const headers = recordToHeaders(rawResponse.headers);
-        let bufferedBody: ArrayBuffer | null | undefined;
-
-        if (this.#progressHandler && rawResponse.body) {
-          bufferedBody = await readResponseWithProgress(rawResponse, this.#progressHandler);
-        }
-
-        if (httpRevalidate && rawResponse.status === 304) {
-          const revalidated = await processRevalidationResponse(httpRevalidate, ctx, {
-            data: httpRevalidate.entry.data,
-            httpStatus: rawResponse.status,
-            statusText: rawResponse.statusText,
-            headers,
-          });
-
-          const result: QHttpResult<T> = {
-            data: revalidated.data as T,
-            httpStatus: revalidated.httpStatus,
-            statusText: revalidated.statusText,
-            headers: revalidated.headers,
-            ok: revalidated.httpStatus >= 200 && revalidated.httpStatus < 300,
-            request: finalRequest,
-            fetchStatus: 'success',
-            fromCache: revalidated.fromCache,
-          };
-
-          if (cacheEngine && cacheKey && revalidated.ttlMs > 0) {
-            await this.#hooks.run('postCache', { result, ctx });
-            await cacheEngine.set(cacheKey, revalidated.entry);
-          }
-
-          return result;
-        }
-
-        const data = await parseResponseBody<T>(
-          rawResponse,
-          ctx.responseType,
-          bufferedBody,
-        );
-
-        const result: QHttpResult<T> = {
-          data,
-          httpStatus: rawResponse.status,
-          statusText: rawResponse.statusText,
-          headers,
-          ok: rawResponse.ok,
-          request: finalRequest,
-          fetchStatus: 'success',
-          fromCache: false,
-        };
-
-        const validate = this.#config.validateStatus ?? ((s) => s >= 200 && s < 300);
-        if (!validate(rawResponse.status)) {
-          throw new QHttpError(`Request failed with status ${rawResponse.status}`, {
-            code: 'HTTP_ERROR',
-            httpStatus: rawResponse.status,
-            request: contextToConfig(ctx),
-            result,
-          });
-        }
-
-        if (cacheEngine && cacheKey && this.#isCacheEnabled(ctx.method)) {
-          const shouldWrite = this.#config.cacheWhen?.(ctx, result) ?? true;
-          if (shouldWrite && this.#canCacheResult(result, ctx.responseType)) {
-            await this.#hooks.run('postCache', { result, ctx });
-
-            if (this.#isHttpCacheMode()) {
-              if (httpRevalidate) {
-                const revalidated = await processRevalidationResponse(httpRevalidate, ctx, result);
-                if (revalidated.ttlMs > 0) {
-                  await cacheEngine.set(cacheKey, revalidated.entry);
-                }
-                return {
-                  ...result,
-                  data: revalidated.data as T,
-                  httpStatus: revalidated.httpStatus,
-                  statusText: revalidated.statusText,
-                  headers: revalidated.headers,
-                  ok: revalidated.httpStatus >= 200 && revalidated.httpStatus < 300,
-                  fromCache: revalidated.fromCache,
-                };
-              }
-
-              const stored = await createHttpCacheEntry(ctx, result, this.#config.httpCache);
-              if (stored) {
-                await cacheEngine.set(cacheKey, stored.entry);
-              }
-            } else {
-              const snapshot: CacheSnapshot = {
-                data: result.data,
-                httpStatus: result.httpStatus,
-                statusText: result.statusText,
-                headers: result.headers,
-              };
-              await cacheEngine.set(cacheKey, snapshot, this.#config.cacheTTL);
-            }
-          }
-        }
-
-        return result;
-      } finally {
-        composed.cleanup();
-      }
-    };
-
-    try {
-      if (retryOptions) {
-        if (!isReplayableBody(ctx.body)) {
-          return await runAttempt();
-        }
-
-        return await withRetry(runAttempt, {
-          ...retryOptions,
-          method: ctx.method,
-          signal: cancelGate.signal,
-          onRetry: async (attempt, error) => {
-            await this.#hooks.run('onRetry', { attempt, error });
-          },
-        });
-      }
-
-      return await runAttempt();
     } finally {
-      requestScope.cleanup();
-      if (this.#activeController === requestScope) {
-        this.#activeController = undefined;
-      }
+      scope.cleanup();
+      this.#active.delete(scope);
     }
   }
 
-  #isHttpCacheMode(): boolean {
-    return this.#config.cacheMode === 'http';
-  }
+  // --------------------------------------------------------------- private
 
-  async #runBackgroundRevalidation(
-    ctx: RequestContext,
-    cacheEngine: CacheEngine,
-    cacheKey: string,
-    lookup: Extract<Awaited<ReturnType<typeof lookupHttpCacheEntry>>, { action: 'swr' }>,
-  ): Promise<void> {
-    try {
-      const revalidationCtx: RequestContext = {
-        ...ctx,
-        headers: new Map(ctx.headers),
-      };
-      applyRevalidationHeaders(revalidationCtx, lookup.revalidationHeaders);
-
-      const result = await this.#executeRequest(
-        revalidationCtx,
-        cacheEngine,
-        cacheKey,
-        {
-          entry: lookup.entry,
-          policy: lookup.policy,
-        },
-      );
-
-      if (this.#config.cacheWhen?.(revalidationCtx, result) === false) {
-        return;
-      }
-    } catch {
-      // Background revalidation failures must not affect the caller.
-    }
-  }
-
-  #isCacheEnabled(method: HttpMethod): boolean {
-    if (!this.#config.cache) return false;
-    const methods = this.#config.cacheMethods ?? DEFAULT_CACHE_METHODS;
-    return methods.includes(method);
-  }
-
-  #resolveCacheEngine(): CacheEngine | undefined {
-    if (this.#config.cacheEngine) {
-      return this.#config.cacheEngine;
-    }
-    if (this.#config.cache) {
-      return getDefaultCacheEngine();
-    }
-    return undefined;
-  }
-
-  #hydrateFromSnapshot<T>(snapshot: CacheSnapshot, ctx: RequestContext): QHttpResult<T> {
+  #failedResult<T>(error: QHttpError, ctx: RequestContext): QHttpResult<T> {
+    const partial = error.result;
     return {
-      data: snapshot.data as T,
-      httpStatus: snapshot.httpStatus,
-      statusText: snapshot.statusText,
-      headers: snapshot.headers,
-      ok: snapshot.httpStatus >= 200 && snapshot.httpStatus < 300,
-      request: toFinalRequest(
-        ctx.resolvedUrl,
-        ctx.method,
-        ctx.headers,
-        ctx.body,
-        ctx.signal,
-        this.#progressHandler,
-      ),
-      fetchStatus: 'success',
-      fromCache: true,
+      data: partial?.data as T,
+      httpStatus: error.httpStatus ?? partial?.httpStatus ?? 0,
+      statusText: partial?.statusText ?? error.message,
+      headers: partial?.headers ?? {},
+      ok: false,
+      response: error.response ?? partial?.response,
+      request:
+        partial?.request ??
+        toRequestSummary({
+          url: ctx.resolvedUrl,
+          method: ctx.method,
+          headers: ctx.headers,
+          signal: ctx.signal,
+          init: ctx.fetchOptions,
+        }),
+      fetchStatus: 'error',
+      fromCache: false,
+      error,
+      requestId: ctx.requestId,
+      timing: timingFor(ctx),
     };
-  }
-
-  #canCacheResult(_result: QHttpResult, responseType: ResponseType): boolean {
-    if (isBinaryResponseType(responseType)) {
-      const engine = this.#resolveCacheEngine();
-      if (engine instanceof LocalStorageCacheEngine) {
-        if (process.env.NODE_ENV !== 'production') {
-          console.warn('[qhttp] Skipping localStorage cache for binary response');
-        }
-        return false;
-      }
-    }
-    return true;
   }
 
   async #runErrorHooks(error: QHttpError): Promise<QHttpResult | undefined> {
@@ -702,15 +528,15 @@ export class QHttp {
     return undefined;
   }
 
-  #normalizeError(error: unknown, ctx: RequestContext): QHttpError {
+  #normalizeError(error: unknown, ctx: RequestContext, scope: ComposedSignal): QHttpError {
+    // Once the request scope aborted (cancel, user signal, deadline), report that
+    // reason even if a transport ignored the signal and failed some other way.
+    if (scope.signal.aborted && !(isQHttpError(error) && RESPONSE_ERRORS.has(error.code))) {
+      return abortErrorFor(scope.reason ?? readAbortReason(ctx.signal), ctx, error);
+    }
     if (isQHttpError(error)) return error;
     if (isAbortError(error)) {
-      const reason = this.#activeController?.reason ?? 'ABORTED';
-      return new QHttpError(reason === 'TIMEOUT' ? 'Request timed out' : 'Request aborted', {
-        code: reason,
-        request: contextToConfig(ctx),
-        cause: error,
-      });
+      return abortErrorFor(scope.reason ?? readAbortReason(ctx.signal), ctx, error);
     }
     return new QHttpError('Network request failed', {
       code: 'NETWORK',
@@ -718,25 +544,12 @@ export class QHttp {
       cause: error,
     });
   }
+}
 
-  #createTransportError(
-    cause: unknown,
-    composed: ComposedSignal,
-    ctx: RequestContext,
-    _request: FinalRequest,
-  ): QHttpError {
-    if (isAbortError(cause)) {
-      const reason = composed.reason ?? 'ABORTED';
-      return new QHttpError(reason === 'TIMEOUT' ? 'Request timed out' : 'Request aborted', {
-        code: reason,
-        request: contextToConfig(ctx),
-        cause,
-      });
-    }
-    return new QHttpError('Network request failed', {
-      code: 'NETWORK',
-      request: contextToConfig(ctx),
-      cause,
-    });
-  }
+function isLimiter(value: RateLimitOptions | RateLimiterLike): value is RateLimiterLike {
+  return typeof (value as RateLimiterLike).acquire === 'function';
+}
+
+function isBreaker(value: CircuitBreakerOptions | CircuitBreakerLike): value is CircuitBreakerLike {
+  return typeof (value as CircuitBreakerLike).check === 'function';
 }

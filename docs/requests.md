@@ -6,198 +6,178 @@
 client.setBaseUrl('https://api.example.com');
 client.setUrl('/v1/users');
 
-await client.get(); // GET https://api.example.com/v1/users
-await client.get('/health'); // overrides path for this call only
+await client.get();                          // GET https://api.example.com/v1/users
+await client.get('/health');                 // overrides path for this call only
+await client.get('https://other.example/x'); // absolute URLs bypass baseUrl
 ```
 
-Paths are joined safely — trailing slashes on the base and leading slashes on the path are normalized.
+Paths are joined safely; trailing and leading slashes are normalized.
 
 ```typescript
-import { joinUrl } from '@questorylabs/qhttp';
-
+import { joinUrl, isAbsoluteUrl } from '@questorylabs/qhttp';
 joinUrl('https://api.example.com/', '/users'); // https://api.example.com/users
 ```
 
 ## URL macros
 
-Embed `{{name}}` placeholders in URLs and cache keys:
-
 ```typescript
-client
-  .setUrl('/users/{{userId}}/orders/{{orderId}}')
-  .replaceUrlMacros({ userId: 'u1', orderId: 'o9' });
+client.setUrl('/users/{{userId}}/orders/{{orderId}}').replaceUrlMacros({ userId: 'u1' });
 
-// Resolved: /users/u1/orders/o9
+await client.get(undefined, { macros: { orderId: 'o9' } }); // /users/u1/orders/o9
 ```
 
-Macros must be resolved before the request runs. Missing macros throw `QHttpError` with code `MISSING_URL_MACRO`.
-
-```typescript
-import { resolveMacros, findUnresolvedMacros } from '@questorylabs/qhttp';
-
-resolveMacros('/users/{{id}}', { id: 42 }); // '/users/42'
-findUnresolvedMacros('/users/{{id}}');      // ['id']
-```
+Missing macros throw `QHttpError` with code `MISSING_URL_MACRO`. Values are URI-encoded.
 
 ## Query parameters
 
-Set and merge params across calls:
-
 ```typescript
-client.setQueryParams({ page: 1, limit: 20 });
-client.setQueryParams({ sort: 'name' }); // merges with existing
-
-await client.get('/items');
+client.setQueryParams({ page: 1, limit: 20 });        // instance defaults, merged across calls
+await client.get('/items', { params: { sort: 'name' } }); // merged for this call only
 // GET .../items?page=1&limit=20&sort=name
 ```
 
-Supported value types: strings, numbers, booleans, `Date`, arrays, nested objects, `null` / `undefined` (skipped).
-
-Custom serialization:
-
-```typescript
-client.paramsSerializer((params) =>
-  new URLSearchParams(params as Record<string, string>).toString(),
-);
-```
-
-Or use the utility:
-
-```typescript
-import { serializeParams } from '@questorylabs/qhttp';
-
-serializeParams({ tags: ['a', 'b'], filter: { active: true } });
-```
+Supported values: strings, numbers, booleans, `Date` (ISO), arrays (repeated keys), `null` / `undefined` (skipped). Nested objects throw `UNSERIALIZABLE_PARAM`; use `paramsSerializer` for bracket or comma formats.
 
 ## Headers
 
 ```typescript
-client.setHeaders({
-  'X-App-Version': '2.0',
-  Accept: 'application/json',
-});
+client.setHeaders({ 'X-App-Version': '2.0' });
+await client.get('/x', { headers: { 'x-trace': id } });
 
-// In preRequest — headers are a Map<string, string>
 client.preRequest((ctx) => {
-  ctx.headers.set('x-request-id', crypto.randomUUID());
+  ctx.headers.set('x-request-id', ctx.requestId); // Map with lowercase keys
 });
 ```
 
-Later `setHeaders` calls shallow-merge with prior headers.
+Set a header to `undefined` to remove an instance default.
 
 ## Request body
 
 ```typescript
-// JSON object — Content-Type: application/json added automatically
-await client.setBody({ name: 'Ada', role: 'admin' }).post('/users');
-
-// Raw string
-await client.setBody('plain text').post('/notes');
-
-// FormData, URLSearchParams, Blob, ArrayBuffer, typed arrays
-await client.setBody(formData).post('/upload');
-
-// ReadableStream (Node fetch duplex)
-await client.setBody(stream).post('/ingest');
+await client.post('/users', { body: { name: 'Ada' } });   // JSON, content-type added
+await client.post('/notes', { body: 'plain text' });
+await client.post('/upload', { body: formData });          // multipart
+await client.post('/form', { body: new URLSearchParams({ a: '1' }) });
+await client.post('/bin', { body: new Blob([bytes]) });
+await client.post('/ingest', { body: readableStream });    // duplex: 'half'; never retried
 ```
 
-`GET` and `HEAD` cannot carry a body — attempting to do so throws `BODY_NOT_ALLOWED`.
-
-Clear body between calls by not reusing a client configured with a stale body, or clone:
-
-```typescript
-const base = new QHttp({ baseUrl: url });
-await base.setBody({ a: 1 }).post('/a');
-await base.clone().get('/b'); // no body
-```
+`GET` and `HEAD` cannot carry a body (`BODY_NOT_ALLOWED`). Prefer per-call `body` over `setBody` on shared clients so bodies never leak between calls.
 
 ## Response types
 
-Default `responseType` is `auto`:
+Default `responseType: 'auto'`:
 
-| Content-Type hint | Parsed as |
-|-------------------|-----------|
-| `application/json` | JSON |
-| `text/*` | string |
-| other | `ArrayBuffer` |
+| Content-Type | Parsed as |
+|--------------|-----------|
+| `*json*` | JSON (empty body → `undefined`) |
+| `text/*`, XML, SVG, YAML, JavaScript, form-urlencoded, missing | string |
+| anything else | `ArrayBuffer` |
 
-Force a type:
+Force a type per client or per call: `'json' | 'text' | 'blob' | 'arrayBuffer' | 'stream'`.
 
 ```typescript
-client.setResponseType('json');       // always JSON.parse
-client.setResponseType('text');       // string
-client.setResponseType('blob');       // Blob
-client.setResponseType('arrayBuffer'); // ArrayBuffer
-client.setResponseType('stream');     // ReadableStream (no auto-parse)
+const { data } = await client.get<ReadableStream>('/big', { responseType: 'stream' });
 ```
+
+## Validation
+
+`parse` accepts a [Standard Schema](https://standardschema.dev) (zod, valibot, arktype and others) or a plain function. It runs after `validateStatus` and before the result is cached.
+
+```typescript
+import { z } from 'zod';
+
+const User = z.object({ id: z.string(), name: z.string() });
+
+const { data } = await client.get('/users/u1', { parse: User }); // data: { id: string; name: string }
+
+client.parse((raw) => normalize(raw)); // instance default
+```
+
+Failures throw `VALIDATION_ERROR` with `error.issues` and the raw body on `error.data`.
+
+## Fetch options
+
+Anything `fetch` accepts beyond method, headers, body and signal:
+
+```typescript
+client.setFetchOptions({ credentials: 'include', cache: 'no-store' });
+await client.get('/x', { fetchOptions: { priority: 'high', keepalive: true } });
+```
+
+On Node, pass an undici `dispatcher` for connection pooling or proxies. Custom adapters receive these as `request.init`.
 
 ## Progress
 
-`onProgress` reports both upload and download bytes. Events include `direction: 'upload' | 'download'`.
-
-### Download
-
-Track bytes while the response body is read:
+`onProgress` reports upload and download bytes with `direction`.
 
 ```typescript
-client.onProgress((event) => {
-  if (event.direction === 'download') {
-    console.log(event.loaded, event.total);
-  }
+await client.post('/upload', {
+  body: new Blob([largeFile]),
+  onProgress: (e) => setPercent(e.direction === 'upload' ? e.loaded / (e.total ?? 1) : 1),
 });
-
-// Requires non-stream responseType (auto/json/text/blob/arrayBuffer)
-```
-
-### Upload
-
-QHttp wraps the request body in a `ReadableStream` (`duplex: 'half'`) and emits progress as the adapter pulls chunks:
-
-```typescript
-client
-  .setBody(new Blob([largeFile]))
-  .onProgress((event) => {
-    if (event.direction === 'upload') {
-      console.log(event.loaded, event.total);
-    }
-  });
-
-await client.post('/upload');
 ```
 
 | Body | `loaded` | `total` |
 |------|----------|---------|
-| string / JSON / Blob / ArrayBuffer / typed arrays / URLSearchParams | yes | exact (+ `Content-Length`) |
-| FormData | yes (via platform `Request` serialization) | estimated from field sizes |
-| opaque `ReadableStream` | yes | only if `Content-Length` is set |
+| string / JSON / Blob / ArrayBuffer / typed arrays / URLSearchParams | yes | exact |
+| FormData | yes | estimated |
+| opaque `ReadableStream` | yes | only with `Content-Length` |
 
-Use the default fetch adapter for upload progress — `Http2Adapter` does not accept stream bodies.
+Download progress requires a non-stream `responseType`. Use the fetch adapter; `Http2Adapter` does not accept stream bodies.
 
-## Timeouts
+## Timeouts and deadline
 
 ```typescript
-client.setTimeout(5000); // ms; uses AbortController internally
+client.setTimeout(5_000);   // per attempt → TIMEOUT
+client.setDeadline(20_000); // whole request including retries → DEADLINE
 ```
 
-Timeout aborts surface as `QHttpError` with code `TIMEOUT`.
-
-## Abort signals
+## Abort
 
 ```typescript
 const controller = new AbortController();
-client.setSignal(controller.signal);
+await client.get('/x', { signal: controller.signal });
+controller.abort(); // → ABORTED
 
-controller.abort(); // or client.cancel()
+client.cancel();    // aborts every in-flight request on this instance
 ```
 
-External signal and timeout are composed — either can abort the request.
+## Pagination
+
+`paginate` returns an async iterable of results plus `.items()` and `.all()`:
+
+```typescript
+import { pageParam, cursorParam, linkHeader } from '@questorylabs/qhttp';
+
+const pages = client.paginate<Page>({
+  url: '/orders',
+  params: { page: 1, limit: 50 },
+  next: pageParam({ hasMore: (r) => r.data.hasMore }),
+  maxPages: 100,
+});
+
+for await (const order of pages.items((p) => p.items)) handle(order);
+
+await client.paginate<Feed>({ url: '/feed', next: cursorParam({ getCursor: (r) => r.data.nextCursor }) }).all();
+await client.paginate<Repo[]>({ url: '/repos', next: linkHeader() }).all(); // RFC 8288 Link: rel="next"
+```
+
+`next` receives the last result and page number and returns the options for the next page, or a falsy value to stop.
+
+## Dedupe
+
+```typescript
+client.dedupe(); // identical concurrent GET/HEAD/OPTIONS share one response
+await Promise.all([client.get('/me'), client.get('/me')]); // one network call
+```
 
 ## Guidelines
 
-1. **Reuse clients** for shared base URL, auth, and hooks; override URL per call when needed.
-2. **Resolve macros** before requests — use `replaceUrlMacros` or constructor `urlMacros`.
-3. **Don't cache POST bodies** on a shared client without cloning — body sticks until changed.
-4. **Type your `get<T>()`** — parsing is runtime; TypeScript types are your contract.
+1. **Reuse clients**, override per call. Cloning is only needed to fork hooks or middleware.
+2. **Prefer per-call `body`** over `setBody` on shared clients.
+3. **Validate at the edge** with `parse` on responses you render or store.
+4. **Set a deadline** on user-facing calls that also retry.
 5. **Use `stream` responseType** when piping large downloads without buffering.
 
 See also: [Caching](./caching.md), [Retry & errors](./retry-and-errors.md).

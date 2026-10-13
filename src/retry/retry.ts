@@ -1,8 +1,9 @@
-import { isQHttpError, QHttpError } from '../errors/qhttp-error.js';
+import { isQHttpError } from '../errors/qhttp-error.js';
 import type { HttpMethod, RetryOptions } from '../core/types.js';
 import { sleep } from '../utils/abortable.js';
 
 const IDEMPOTENT_METHODS = new Set<HttpMethod>(['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS']);
+const RETRYABLE_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
 
 export interface RetryExecutionOptions extends Required<Pick<RetryOptions, 'retries' | 'retryDelay'>> {
   backoff: NonNullable<RetryOptions['backoff']>;
@@ -42,6 +43,7 @@ export async function withRetry<T>(
       return await exec();
     } catch (error) {
       attempt++;
+      if (options.signal?.aborted) throw error;
       const shouldRetry =
         attempt <= options.retries &&
         (options.retryOn?.(error, attempt) ?? isRetryableDefault(error, options.method));
@@ -71,10 +73,12 @@ export function isRetryableDefault(error: unknown, method: HttpMethod): boolean 
   if (isQHttpError(error)) {
     if (error.code === 'TIMEOUT' || error.code === 'NETWORK') return true;
     if (error.httpStatus) {
-      return [408, 425, 429, 502, 503, 504].includes(error.httpStatus);
+      return RETRYABLE_STATUSES.has(error.httpStatus);
     }
+    return false;
   }
 
+  // Raw fetch failures surface as TypeError when no adapter wrapped them.
   if (error instanceof TypeError) {
     return true;
   }
@@ -95,10 +99,11 @@ export function computeRetryDelay(
 
 function applyJitter(delay: number, enabled: boolean): number {
   if (!enabled) return delay;
-  return Math.random() * delay;
+  // "Equal jitter": never collapse to ~0, never exceed the base delay.
+  return delay / 2 + Math.random() * (delay / 2);
 }
 
-function retryAfterMs(error: unknown): number | undefined {
+export function retryAfterMs(error: unknown): number | undefined {
   if (!isQHttpError(error) || !error.result?.headers) {
     return undefined;
   }
@@ -108,7 +113,7 @@ function retryAfterMs(error: unknown): number | undefined {
 
   const seconds = Number(header);
   if (!Number.isNaN(seconds)) {
-    return seconds * 1000;
+    return Math.max(0, seconds * 1000);
   }
 
   const date = Date.parse(header);
@@ -117,11 +122,4 @@ function retryAfterMs(error: unknown): number | undefined {
   }
 
   return undefined;
-}
-
-export function createRetryError(original: unknown): QHttpError {
-  if (isQHttpError(original)) {
-    return original;
-  }
-  return new QHttpError('Request failed', { cause: original, code: 'NETWORK' });
 }

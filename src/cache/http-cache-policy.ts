@@ -7,10 +7,10 @@ import type {
   RequestContext,
 } from '../core/types.js';
 import { headersToRecord } from '../utils/headers.js';
-import { toFinalRequest } from '../core/body.js';
-import type { ProgressEvent } from '../core/types.js';
+import { toRequestSummary } from '../core/body.js';
+import { makeResult } from '../core/result.js';
 
-type CachePolicyConstructor = typeof import('http-cache-semantics');
+type CachePolicyConstructor = typeof CachePolicy;
 
 let cachePolicyModule: CachePolicyConstructor | undefined;
 
@@ -248,23 +248,19 @@ export function hydrateHttpCacheResult<T>(
   entry: HttpCacheEntry,
   headers: Record<string, string>,
   ctx: RequestContext,
-  progressHandler?: (event: ProgressEvent) => void,
 ): QHttpResult<T> {
-  return {
+  return makeResult<T>(ctx, {
     data: entry.data as T,
     httpStatus: entry.httpStatus,
     statusText: entry.statusText,
     headers,
-    ok: entry.httpStatus >= 200 && entry.httpStatus < 300,
-    request: toFinalRequest(
-      ctx.resolvedUrl,
-      ctx.method,
-      ctx.headers,
-      ctx.body,
-      ctx.signal,
-      progressHandler,
-    ),
-    fetchStatus: 'success',
+    request: toRequestSummary({
+      url: ctx.resolvedUrl,
+      method: ctx.method,
+      headers: ctx.headers,
+      signal: ctx.signal,
+      init: ctx.fetchOptions,
+    }),
     fromCache: true,
-  };
+  });
 }

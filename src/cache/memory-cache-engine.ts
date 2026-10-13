@@ -1,11 +1,11 @@
-import type { CacheSnapshot } from '../core/types.js';
 import type { CacheEngine } from './cache-engine.interface.js';
 
 interface CacheEntry {
-  value: CacheSnapshot;
+  value: unknown;
   expiresAt?: number;
 }
 
+/** LRU in-memory cache. `ttlMs` of `0`/`undefined` means no expiry. */
 export class MemoryCacheEngine implements CacheEngine {
   readonly #store = new Map<string, CacheEntry>();
   readonly #maxSize: number;
@@ -14,7 +14,11 @@ export class MemoryCacheEngine implements CacheEngine {
     this.#maxSize = options.maxSize ?? 500;
   }
 
-  async get(key: string): Promise<CacheSnapshot | undefined> {
+  get size(): number {
+    return this.#store.size;
+  }
+
+  async get(key: string): Promise<unknown> {
     const entry = this.#store.get(key);
     if (!entry) return undefined;
 
@@ -31,12 +35,12 @@ export class MemoryCacheEngine implements CacheEngine {
   async set(key: string, value: unknown, ttlMs?: number): Promise<void> {
     if (this.#store.size >= this.#maxSize && !this.#store.has(key)) {
       const firstKey = this.#store.keys().next().value;
-      if (firstKey) this.#store.delete(firstKey);
+      if (firstKey !== undefined) this.#store.delete(firstKey);
     }
 
     this.#store.set(key, {
-      value: value as CacheSnapshot,
-      expiresAt: ttlMs ? Date.now() + ttlMs : undefined,
+      value,
+      expiresAt: ttlMs && Number.isFinite(ttlMs) ? Date.now() + ttlMs : undefined,
     });
   }
 

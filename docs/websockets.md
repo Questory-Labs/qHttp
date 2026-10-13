@@ -1,6 +1,6 @@
 # WebSockets
 
-WebSocket support lives in `@questorylabs/qhttp/ws` via `QWebSocket` — a chainable client with reconnect, heartbeat, and a pluggable adapter layer (mirroring HTTP adapters).
+`@questorylabs/qhttp/ws` provides `QWebSocket`: reconnect, heartbeat, send queue, typed JSON helper and a pluggable adapter layer.
 
 ## Browser quick start
 
@@ -9,146 +9,73 @@ import { QWebSocket } from '@questorylabs/qhttp/ws';
 
 const socket = new QWebSocket('wss://example.com/socket')
   .setProtocols(['v1'])
-  .setReconnect({ retries: 5, delay: 1000, backoff: 'exponential', maxDelay: 30_000 })
-  .setHeartbeat({ intervalMs: 30_000, message: 'ping', pongTimeoutMs: 5_000 })
+  .setReconnect({ retries: 5, delay: 1000, backoff: 'exponential', maxDelay: 30_000, jitter: true })
+  .setHeartbeat({ intervalMs: 30_000, message: 'ping', isPong: 'pong', pongTimeoutMs: 5_000 })
   .onOpen(() => console.log('connected'))
   .onMessage((msg) => console.log(msg.data))
+  .onJson<ServerEvent>((event) => handle(event))
   .onError((err) => console.error(err))
   .onClose((ev) => console.log(ev.code, ev.reason))
   .onReconnect((attempt) => console.log('reconnect', attempt))
+  .onReconnected((attempt) => resubscribe())
+  .onStateChange((state) => setStatus(state))
   .connect();
 
 socket.sendJson({ type: 'subscribe', channel: 'orders' });
-socket.send('raw string');
 socket.close(1000, 'done');
 ```
 
-Default adapter: `BrowserWSAdapter` (native `WebSocket`).
-
 ## Node (`ws` peer)
-
-Install the optional peer:
-
-```bash
-pnpm add ws
-```
-
-Create the adapter before connecting:
 
 ```typescript
 import { QWebSocket, NodeWSAdapter } from '@questorylabs/qhttp/ws';
 
 const adapter = await NodeWSAdapter.create();
-
 const socket = new QWebSocket('wss://example.com/socket')
   .setAdapter(adapter)
-  .setHeaders({ Authorization: 'Bearer token' }) // Node only — not in browser
+  .setHeaders({ Authorization: 'Bearer token' })
   .connect();
 ```
 
-`NodeWSAdapter.create()` dynamically imports `ws` so browser bundles stay lean.
-
-Deprecated helper (still works):
-
-```typescript
-import { createNodeWSSocket } from '@questorylabs/qhttp/ws';
-const raw = await createNodeWSSocket({ url: 'wss://...', headers: {} });
-```
-
-Prefer `NodeWSAdapter.create()` + `QWebSocket`.
+Browsers cannot send custom headers; the browser adapter warns in development if you pass any. Use a query string, a subprotocol or the first message instead.
 
 ## Reconnect
 
-```typescript
-socket.setReconnect({
-  retries: 5,           // max attempts after unclean close
-  delay: 1000,          // base delay ms
-  backoff: 'exponential', // or 'fixed'
-  maxDelay: 30_000,
-});
-```
-
-Reconnect triggers on abnormal close codes — not on clean close (`1000`, `1001`).
+Triggered on abnormal close codes (not `1000` / `1001`) and not after `close()`. `retries` counts consecutive attempts and resets when a connection opens. `readyState` stays `'reconnecting'` until the replacement socket opens; `onReconnected` fires then. Listeners on the old socket are detached, so late events from it are ignored.
 
 ## Heartbeat
 
 ```typescript
-socket.setHeartbeat({
-  intervalMs: 30_000,
-  message: 'ping',      // string or ArrayBuffer
-  pongTimeoutMs: 5_000, // close if no message received
-});
+socket.setHeartbeat({ intervalMs: 30_000, message: 'ping', pongTimeoutMs: 5_000, isPong: (d) => d === 'pong' });
 ```
 
-Any incoming message resets the pong timer — not only literal `pong` replies.
+Without `isPong`, any incoming frame resets the pong timer. On timeout the socket closes with code `4000` and reconnect (if configured) kicks in.
 
-## Send queue
+## Send queue and backpressure
 
-Messages sent while disconnected are queued (default limit: 100). Queue overflows throw.
-
-```typescript
-new QWebSocket(url, { queueLimit: 50 });
-```
-
-Queue flushes on `open`.
+Messages sent while not open are queued (`queueLimit`, default 100; overflow throws) and flushed on open. `socket.queuedCount` and `socket.bufferedAmount` (from the underlying socket, when exposed) help apply backpressure.
 
 ## Ready state
 
-```typescript
-socket.readyState;
-// 'connecting' | 'open' | 'closing' | 'closed' | 'reconnecting'
-```
+`'connecting' | 'open' | 'closing' | 'closed' | 'reconnecting'`, also delivered through `onStateChange`.
 
-## Event subscription
+## Events
 
-```typescript
-socket.onMessage(handler);
-socket.off('message', handler); // unsubscribe
-```
+`on(event, fn)` / `off(event, fn)` for `open`, `message`, `error`, `close`, `reconnect`, `reconnected`, `state`.
 
-## Custom WS adapter
+## Custom adapter
 
 ```typescript
-import type { WSAdapter, WSAdapterConnectOptions } from '@questorylabs/qhttp/ws';
+import type { WSAdapter, WSAdapterConnectOptions, WSAdapterSocket } from '@questorylabs/qhttp/ws';
 
 class MyAdapter implements WSAdapter {
-  connect(options: WSAdapterConnectOptions) {
-    // return WSAdapterSocket with addEventListener, send, close, readyState
-  }
+  connect(options: WSAdapterConnectOptions): WSAdapterSocket { /* ... */ }
 }
-
-socket.setAdapter(new MyAdapter());
 ```
-
-See `BrowserWSAdapter` and `NodeWSAdapter` for reference implementations.
 
 ## Guidelines
 
-1. **Await `NodeWSAdapter.create()`** before `connect()` in Node — avoids race on dynamic import.
-2. **Use `sendJson`** for structured messages — handles `JSON.stringify`.
-3. **Heartbeat + reconnect** together for long-lived dashboards and live feeds.
-4. **Call `close()`** on teardown — sets manual close flag and stops reconnect loops.
-5. **Headers on Node** — only via `setHeaders` + `NodeWSAdapter`; browsers cannot set arbitrary WS headers.
-
-## HTTP + WS together
-
-```typescript
-import { QHttp } from '@questorylabs/qhttp';
-import { QWebSocket, NodeWSAdapter } from '@questorylabs/qhttp/ws';
-
-const api = new QHttp({ baseUrl: 'https://api.example.com' });
-const { data } = await api
-  .post('/auth/login')
-  .setBody({ user, pass })
-  .get<{ token: string }>();
-
-const adapter = await NodeWSAdapter.create();
-
-new QWebSocket('wss://stream.example.com')
-  .setAdapter(adapter)
-  .setHeaders({ Authorization: `Bearer ${data.token}` })
-  .onMessage((msg) => console.log(msg.data))
-  .connect();
-```
-
-In the browser, auth for WebSockets usually goes in the query string or first message — `setHeaders` is Node-only.
+1. **Await `NodeWSAdapter.create()`** before `connect()` in Node.
+2. **Match pongs explicitly** with `isPong` when the server is chatty.
+3. **Resubscribe in `onReconnected`**, not in `onOpen`, when subscriptions are per connection.
+4. **Call `close()` on teardown**; it stops reconnect loops and heartbeats.

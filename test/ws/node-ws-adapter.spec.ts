@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { NodeWSAdapter, createNodeWSSocket } from '../../src/ws/node-ws-adapter.js';
+import { NodeWSAdapter } from '../../src/ws/node-ws-adapter.js';
 
 describe('NodeWSAdapter', () => {
   it('connects through an injected WebSocket constructor', () => {

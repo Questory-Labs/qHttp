@@ -1,66 +1,62 @@
 # Adapters
 
-HTTP transport is pluggable via the `HttpAdapter` interface. QHttp builds a `FinalRequest` and parses the `RawResponseLike` return value — adapters only handle wire I/O.
+Transport is pluggable via `HttpAdapter`. QHttp builds a `FinalRequest` and parses the `RawResponseLike` the adapter returns; adapters only handle wire I/O.
 
-## Default: FetchAdapter
-
-All environments with `fetch` use `FetchAdapter` automatically:
+## FetchAdapter (default)
 
 ```typescript
-import { QHttp, FetchAdapter, defaultFetchAdapter } from '@questorylabs/qhttp';
+import { QHttp, FetchAdapter } from '@questorylabs/qhttp';
 
-// implicit
-const client = new QHttp();
+const client = new QHttp(); // global fetch
 
-// explicit
-const client = new QHttp().setAdapter(defaultFetchAdapter);
+const session = new QHttp().setAdapter(
+  new FetchAdapter({ defaults: { credentials: 'include', cache: 'no-store' } }),
+);
+
+const undiciClient = new QHttp().setAdapter(new FetchAdapter({ fetch: undici.fetch }));
 ```
 
-`FetchAdapter` passes through to global `fetch` with standard `Request` options.
+Fetch init fields reach the adapter through `request.init`; set them with `setFetchOptions` or per-call `fetchOptions`. The native `Response` is exposed as `result.response`.
 
 ## HTTP/2 (Node)
 
-Optional entry point — uses Node `http2` module:
-
 ```typescript
-import { QHttp } from '@questorylabs/qhttp';
 import { Http2Adapter } from '@questorylabs/qhttp/http2';
 
-const client = new QHttp().setAdapter(new Http2Adapter());
-
-await client.get('https://api.example.com/v1/items');
-```
-
-### HTTP/2 body support
-
-Supported request bodies: string, Buffer, ArrayBuffer, typed arrays, Blob, `URLSearchParams`.
-
-**Not supported:** `FormData`, `ReadableStream` — use `FetchAdapter` for those.
-
-## Custom adapter
-
-Implement `HttpAdapter`:
-
-```typescript
-import type { HttpAdapter, RawResponseLike, FinalRequest } from '@questorylabs/qhttp';
-
-class LoggingAdapter implements HttpAdapter {
-  constructor(private inner: HttpAdapter) {}
-
-  async send(request: FinalRequest): Promise<RawResponseLike> {
-    console.log(request.method, request.url);
-    return this.inner.send(request);
-  }
-}
-
 const client = new QHttp().setAdapter(
-  new LoggingAdapter(defaultFetchAdapter),
+  new Http2Adapter({ sessionIdleMs: 60_000, connectOptions: { ca } }),
 );
 ```
 
-### RawResponseLike
+One session per origin, closed after `sessionIdleMs` of inactivity. Connection-specific headers (`connection`, `transfer-encoding`, `host`, ...) are stripped. Supported bodies: string, Buffer, ArrayBuffer, typed arrays, Blob, `URLSearchParams`. `FormData` and `ReadableStream` are rejected; responses are buffered.
 
-Your adapter must return an object compatible with:
+## Custom adapter
+
+```typescript
+import type { HttpAdapter, FinalRequest, RawResponseLike } from '@questorylabs/qhttp';
+import { wrapFetchResponse, defaultFetchAdapter } from '@questorylabs/qhttp';
+
+class LoggingAdapter implements HttpAdapter {
+  constructor(private inner: HttpAdapter = defaultFetchAdapter) {}
+
+  async send(request: FinalRequest): Promise<RawResponseLike> {
+    console.log(request.method, request.url, request.init);
+    return this.inner.send(request);
+  }
+}
+```
+
+### FinalRequest
+
+| Field | Notes |
+|-------|-------|
+| `url`, `method`, `headers` | Headers as a plain lowercase record |
+| `body` | `BodyInit`, possibly a progress-wrapped `ReadableStream` |
+| `signal` | Composed abort signal; honour it |
+| `duplex` | `'half'` when the body is a stream |
+| `init` | Fetch passthrough (`credentials`, `cache`, `dispatcher`, ...) |
+
+### RawResponseLike
 
 ```typescript
 interface RawResponseLike {
@@ -73,52 +69,21 @@ interface RawResponseLike {
   json(): Promise<unknown>;
   text(): Promise<string>;
   blob(): Promise<Blob>;
+  raw?: Response; // optional native response
 }
 ```
 
-QHttp uses `body` for progress tracking; fallback methods parse when the stream is consumed.
+`wrapFetchResponse(response)` builds one from a `Response`. QHttp reads `body` for progress tracking and falls back to the methods otherwise.
 
-## Testing with a mock adapter
+Throw a `DOMException` named `AbortError` when `signal` fires so the client reports `TIMEOUT`, `DEADLINE` or `ABORTED` correctly.
 
-```typescript
-import type { HttpAdapter, RawResponseLike } from '@questorylabs/qhttp';
+## Testing
 
-function mockJson(data: unknown): RawResponseLike {
-  const json = JSON.stringify(data);
-  const bytes = new TextEncoder().encode(json);
-  return {
-    ok: true,
-    status: 200,
-    statusText: 'OK',
-    headers: { 'content-type': 'application/json' },
-    body: new ReadableStream({
-      start(c) {
-        c.enqueue(bytes);
-        c.close();
-      },
-    }),
-    arrayBuffer: async () => bytes.buffer,
-    json: async () => data,
-    text: async () => json,
-    blob: async () => new Blob([json]),
-  };
-}
-
-class MockAdapter implements HttpAdapter {
-  async send() {
-    return mockJson({ ok: true });
-  }
-}
-
-const client = new QHttp({ adapter: new MockAdapter() });
-```
+Use `MockAdapter` from `@questorylabs/qhttp/testing`; see [Testing](./testing.md).
 
 ## Guidelines
 
-1. **Default fetch** is enough for most apps — adapters are for HTTP/2, proxies, or telemetry wrappers.
-2. **Wrap, don't fork** — decorate `defaultFetchAdapter` instead of reimplementing fetch.
-3. **HTTP/2** — one connection per origin is handled inside `Http2Adapter`; reuse the client instance.
-4. **No HTTP/3 in core** — bring your own adapter if you need QUIC.
-5. **Adapters are per client** — different clients can use different transports.
-
-See [WebSockets](./websockets.md) for the separate WS adapter system.
+1. **Default fetch** covers most apps; adapters are for HTTP/2, proxies, telemetry or tests.
+2. **Wrap, don't fork**: decorate `defaultFetchAdapter`.
+3. **Adapters are per client**; share instances when they hold connections (`Http2Adapter`).
+4. **No HTTP/3 in core**; bring your own adapter for QUIC.

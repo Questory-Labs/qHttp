@@ -33,9 +33,28 @@ export type QueryParams = Record<string, QueryValue>;
 
 export type HeadersInit = Record<string, string | undefined>;
 
+/** Token source: static string or (async) provider called on every request. */
+export type TokenSource = string | (() => string | Promise<string>);
+
+export interface AuthRefreshOptions {
+  /** HTTP statuses that trigger a refresh. Default `[401]`. */
+  on?: number[];
+  /**
+   * Refresh credentials. Return the new bearer token, or nothing when the
+   * token source is a function that already reads fresh state.
+   * Concurrent requests share one in-flight refresh.
+   */
+  run: () => Promise<string | void>;
+}
+
 export type AuthConfig =
-  | { type: 'bearer'; token: string }
-  | { type: 'basic'; username: string; password: string };
+  | { type: 'bearer'; token: TokenSource; refresh?: AuthRefreshOptions }
+  | { type: 'basic'; username: string; password: string }
+  | {
+      type: 'custom';
+      apply: (ctx: RequestContext) => void | Promise<void>;
+      refresh?: AuthRefreshOptions;
+    };
 
 export type BackoffStrategy = 'fixed' | 'exponential';
 
@@ -66,6 +85,91 @@ export interface HttpCacheOptions {
   cacheHeuristic?: number;
   immutableMinTimeToLive?: number;
   ignoreCargoCult?: boolean;
+  /**
+   * How long a stale entry stays in the engine past its freshness lifetime so
+   * it can serve conditional revalidation and stale-while-revalidate.
+   * Default 24h.
+   */
+  staleRetentionMs?: number;
+}
+
+/**
+ * Options forwarded verbatim to the transport (`fetch` init for the default
+ * adapter). `method`, `headers`, `body` and `signal` are owned by QHttp.
+ */
+export type FetchOptions = Omit<RequestInit, 'method' | 'headers' | 'body' | 'signal'> & {
+  /** undici `Dispatcher` / `Agent` on Node. */
+  dispatcher?: unknown;
+  [key: string]: unknown;
+};
+
+export interface StandardSchemaIssue {
+  message: string;
+  path?: ReadonlyArray<unknown>;
+}
+
+export type StandardSchemaResult<T> =
+  | { value: T; issues?: undefined }
+  | { issues: ReadonlyArray<StandardSchemaIssue> };
+
+/** Standard Schema v1 subset. zod, valibot, arktype and others implement it. */
+export interface StandardSchema<T = unknown> {
+  '~standard': {
+    version: 1;
+    vendor: string;
+    validate: (value: unknown) => StandardSchemaResult<T> | Promise<StandardSchemaResult<T>>;
+  };
+}
+
+export type ResponseParser<T = unknown> =
+  | StandardSchema<T>
+  | ((data: unknown) => T | Promise<T>);
+
+export interface RateLimitOptions {
+  /** Sustained requests per second per origin. */
+  requestsPerSecond?: number;
+  /** Bucket size. Default `requestsPerSecond`. */
+  burst?: number;
+  /** Max in-flight requests per origin. */
+  concurrency?: number;
+}
+
+export interface CircuitBreakerOptions {
+  /** Consecutive failures before the circuit opens. Default 5. */
+  failureThreshold?: number;
+  /** Time the circuit stays open before a trial request. Default 30s. */
+  resetAfterMs?: number;
+  /** Which errors count as failures. Default: NETWORK, TIMEOUT and 5xx. */
+  isFailure?: (error: QHttpError) => boolean;
+}
+
+/** Options accepted per call: `client.get(url, options)` / `client.request(options)`. */
+export interface RequestOptions<T = unknown> {
+  url?: string;
+  method?: HttpMethod;
+  params?: QueryParams;
+  headers?: HeadersInit;
+  body?: RequestBody;
+  macros?: Record<string, string | number>;
+  timeout?: number;
+  /** Total time budget across retries, in ms. */
+  deadline?: number;
+  responseType?: ResponseType;
+  signal?: AbortSignal;
+  retry?: RetryOptions | false;
+  cache?: boolean;
+  cacheTTL?: number;
+  cacheKey?: string | ((ctx: RequestContext) => string);
+  auth?: AuthConfig | false;
+  throwOnError?: boolean;
+  validateStatus?: (httpStatus: number) => boolean;
+  fetchOptions?: FetchOptions;
+  parse?: ResponseParser<T>;
+  /** Share one in-flight request between identical concurrent safe calls. */
+  dedupe?: boolean;
+  onProgress?: (event: ProgressEvent) => void;
+  /** Free-form data available to middleware and hooks as `ctx.meta`. */
+  meta?: Record<string, unknown>;
 }
 
 export interface QHttpConfig {
@@ -76,6 +180,7 @@ export interface QHttpConfig {
   queryParams?: QueryParams;
   body?: RequestBody;
   timeout?: number;
+  deadline?: number;
   responseType?: ResponseType;
   adapter?: HttpAdapter;
   retry?: RetryOptions;
@@ -86,6 +191,8 @@ export interface QHttpConfig {
   cacheKey?: string | ((ctx: RequestContext) => string);
   cacheWhen?: (ctx: RequestContext, result?: QHttpResult) => boolean;
   cacheMethods?: HttpMethod[];
+  /** Request headers mixed (hashed) into the default cache key. Default `['authorization']`. */
+  cacheVary?: string[];
   httpCache?: HttpCacheOptions;
   auth?: AuthConfig;
   signal?: AbortSignal;
@@ -93,9 +200,46 @@ export interface QHttpConfig {
   validateStatus?: (httpStatus: number) => boolean;
   paramsSerializer?: (params: QueryParams) => string;
   urlMacros?: Record<string, string | number>;
+  fetchOptions?: FetchOptions;
+  parse?: ResponseParser;
+  dedupe?: boolean;
+  rateLimit?: RateLimitOptions | RateLimiterLike;
+  circuitBreaker?: CircuitBreakerOptions | CircuitBreakerLike;
+  meta?: Record<string, unknown>;
+}
+
+export interface RateLimiterLike {
+  acquire(origin: string, signal?: AbortSignal): Promise<() => void>;
+}
+
+export interface CircuitBreakerLike {
+  check(origin: string): void;
+  recordSuccess(origin: string): void;
+  recordFailure(origin: string, error: QHttpError): void;
+}
+
+export interface RequestTiming {
+  startedAt: number;
+  endedAt: number;
+  durationMs: number;
+  attempts: number;
+}
+
+/** Internal per-run state shared by built-in middleware. */
+export interface RequestRunState {
+  /** Set by the cache middleware while a conditional request is in flight. */
+  httpRevalidate?: unknown;
+  /** Current attempt, 1-based. Bumped by the retry middleware. */
+  attempt: number;
+  /** Set once the auth middleware refreshed credentials for this run. */
+  authRefreshed?: boolean;
+  /** Resolved cache key when caching applies. */
+  cacheKey?: string;
 }
 
 export interface RequestContext {
+  requestId: string;
+  startedAt: number;
   baseUrl?: string;
   url: string;
   resolvedUrl: string;
@@ -104,12 +248,19 @@ export interface RequestContext {
   queryParams: QueryParams;
   body?: RequestBody;
   timeout?: number;
+  deadline?: number;
   responseType: ResponseType;
+  /** Request-scope signal: user signal + `cancel()` + deadline. */
   signal?: AbortSignal;
   macros: Record<string, string | number>;
   auth?: AuthConfig;
   onProgress?: (event: ProgressEvent) => void;
   duplex?: 'half';
+  fetchOptions?: FetchOptions;
+  parse?: ResponseParser;
+  validateStatus?: (httpStatus: number) => boolean;
+  meta: Record<string, unknown>;
+  state: RequestRunState;
 }
 
 export interface ProgressEvent {
@@ -125,6 +276,8 @@ export interface FinalRequest {
   body?: BodyInit | null;
   signal?: AbortSignal;
   duplex?: 'half';
+  /** Transport passthrough (fetch init fields such as `credentials`). */
+  init?: FetchOptions;
 }
 
 export interface RawResponseLike {
@@ -137,6 +290,8 @@ export interface RawResponseLike {
   json: () => Promise<unknown>;
   text: () => Promise<string>;
   blob: () => Promise<Blob>;
+  /** Native response when the transport has one. */
+  raw?: Response;
 }
 
 export interface HttpAdapter {
@@ -149,11 +304,14 @@ export interface QHttpResult<T = unknown> {
   statusText: string;
   headers: Record<string, string>;
   ok: boolean;
+  /** Native `Response` when the adapter exposes one (never for cache hits). */
   response?: Response;
   request: FinalRequest;
   fetchStatus: FetchStatus;
   fromCache: boolean;
   error?: QHttpError;
+  requestId: string;
+  timing: RequestTiming;
 }
 
 export interface CacheSnapshot {
@@ -213,3 +371,9 @@ export type HookPhase =
   | (string & {});
 
 export type HookFn = (ctx: unknown) => unknown | Promise<unknown>;
+
+/** Continue the pipeline. Pass a context to run downstream with a different one. */
+export type Next = (ctx?: RequestContext) => Promise<QHttpResult>;
+
+/** Koa-style request middleware: `(ctx, next) => result`. */
+export type Middleware = (ctx: RequestContext, next: Next) => Promise<QHttpResult>;

@@ -1,16 +1,31 @@
-export type AbortReason = 'ABORTED' | 'TIMEOUT';
+export type AbortReason = 'ABORTED' | 'TIMEOUT' | 'DEADLINE';
 
 export interface ComposedSignal {
   signal: AbortSignal;
   cancel: () => void;
   cleanup: () => void;
-  reason?: AbortReason;
+  readonly reason?: AbortReason;
 }
 
+export interface ComposeSignalOptions {
+  timeoutMs?: number;
+  /** Reason reported when `timeoutMs` elapses. Default `'TIMEOUT'`. */
+  timeoutReason?: AbortReason;
+}
+
+const reasons = new WeakMap<AbortSignal, ComposedSignal>();
+
+/**
+ * Compose an external signal and an optional timer into one signal.
+ * `reason` records why the composed signal aborted. Reasons propagate from
+ * composed parents to composed children.
+ */
 export function composeSignal(
   externalSignal?: AbortSignal,
-  timeoutMs?: number,
+  timeoutMs?: number | ComposeSignalOptions,
 ): ComposedSignal {
+  const options: ComposeSignalOptions =
+    typeof timeoutMs === 'number' ? { timeoutMs } : (timeoutMs ?? {});
   const controller = new AbortController();
   let reason: AbortReason | undefined;
 
@@ -20,22 +35,24 @@ export function composeSignal(
     controller.abort();
   };
 
-  const onExternalAbort = () => onAbort('ABORTED');
+  const onExternalAbort = () => {
+    onAbort(readAbortReason(externalSignal) ?? 'ABORTED');
+  };
 
   if (externalSignal) {
     if (externalSignal.aborted) {
-      onAbort('ABORTED');
+      onExternalAbort();
     } else {
       externalSignal.addEventListener('abort', onExternalAbort, { once: true });
     }
   }
 
   const timer =
-    timeoutMs && timeoutMs > 0
-      ? setTimeout(() => onAbort('TIMEOUT'), timeoutMs)
+    options.timeoutMs && options.timeoutMs > 0 && Number.isFinite(options.timeoutMs)
+      ? setTimeout(() => onAbort(options.timeoutReason ?? 'TIMEOUT'), options.timeoutMs)
       : undefined;
 
-  return {
+  const composed: ComposedSignal = {
     signal: controller.signal,
     cancel: () => onAbort('ABORTED'),
     cleanup: () => {
@@ -46,6 +63,14 @@ export function composeSignal(
       return reason;
     },
   };
+  reasons.set(controller.signal, composed);
+  return composed;
+}
+
+/** Read the qhttp abort reason recorded on a composed signal, if any. */
+export function readAbortReason(signal?: AbortSignal): AbortReason | undefined {
+  if (!signal) return undefined;
+  return reasons.get(signal)?.reason;
 }
 
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {

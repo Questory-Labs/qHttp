@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { QHttp } from '../../src/core/QHttp.js';
 import type { HttpAdapter, ProgressEvent, RawResponseLike } from '../../src/core/types.js';
-import { QHttpError } from '../../src/errors/qhttp-error.js';
 import { MemoryCacheEngine } from '../../src/cache/memory-cache-engine.js';
 import { configureDefaultCacheEngine } from '../../src/cache/default-cache-engine.js';
 
