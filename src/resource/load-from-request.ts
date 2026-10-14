@@ -8,6 +8,9 @@ import type { QHttp } from '../core/QHttp.js';
 export function loadFromRequest<T>(client: QHttp): () => Promise<T> {
   return async () => {
     const result = await client.get<T>();
+    if (!result.ok) {
+      throw result.error ?? new Error(`Request failed with status ${result.httpStatus}`);
+    }
     return result.data;
   };
 }

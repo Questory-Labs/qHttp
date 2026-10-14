@@ -1,3 +1,4 @@
+import { isAbsoluteUrl } from '../utils/url.js';
 import type { QHttpResult, RequestOptions } from './types.js';
 
 export type NextPage<T> = (
@@ -32,7 +33,11 @@ export function createPaginator<T>(
       yield result;
       const following = next(result, page);
       if (!following) return;
-      current = { ...current, ...following, params: { ...current.params, ...following.params } };
+      // A new URL is a complete next-page address; don't carry the old query forward.
+      const params = following.url
+        ? following.params
+        : { ...current.params, ...following.params };
+      current = { ...current, ...following, params };
     }
   }
 
@@ -75,21 +80,70 @@ export function cursorParam<T>(options: {
   };
 }
 
-/** RFC 8288 `Link: <url>; rel="next"` pagination. */
-export function linkHeader<T>(): NextPage<T> {
+/**
+ * RFC 8288 `Link: <url>; rel="next"` pagination. Absolute links to another
+ * origin are rejected unless `allowCrossOrigin` is set, so configured
+ * credentials are never sent to a host the caller did not choose.
+ */
+export function linkHeader<T>(options: { allowCrossOrigin?: boolean } = {}): NextPage<T> {
   return (result) => {
     const link = result.headers.link ?? result.headers.Link;
     if (!link) return null;
     const url = parseNextLink(link);
-    return url ? { url, params: {} } : null;
+    if (!url) return null;
+    if (!options.allowCrossOrigin && isAbsoluteUrl(url) && !isSameOrigin(url, result.request.url)) {
+      throw new Error(`linkHeader: refusing cross-origin next link ${url}`);
+    }
+    return { url, params: {} };
   };
 }
 
+function isSameOrigin(link: string, requestUrl: string): boolean {
+  const location = (globalThis as { location?: { href?: string } }).location?.href;
+  try {
+    const request = new URL(requestUrl, location);
+    return new URL(link, request).origin === request.origin;
+  } catch {
+    return false;
+  }
+}
+
 export function parseNextLink(header: string): string | undefined {
-  for (const part of header.split(',')) {
-    const match = /<([^>]+)>\s*;(.*)/.exec(part.trim());
+  for (const part of splitOutside(header, ',')) {
+    const match = /^<([^>]*)>(.*)$/s.exec(part.trim());
     if (!match) continue;
-    if (/rel\s*=\s*"?next"?/i.test(match[2] ?? '')) return match[1];
+    for (const param of splitOutside(match[2] ?? '', ';')) {
+      const eq = param.indexOf('=');
+      if (eq === -1 || param.slice(0, eq).trim().toLowerCase() !== 'rel') continue;
+      const value = param.slice(eq + 1).trim().replace(/^"(.*)"$/s, '$1');
+      if (value.toLowerCase().split(/\s+/).includes('next')) return match[1];
+    }
   }
   return undefined;
+}
+
+/** Split on `separator` outside `<...>` and quoted strings. */
+function splitOutside(input: string, separator: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let inAngle = false;
+  let inQuote = false;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (inQuote) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inQuote = false;
+    } else if (inAngle) {
+      if (ch === '>') inAngle = false;
+    } else if (ch === '"') {
+      inQuote = true;
+    } else if (ch === '<') {
+      inAngle = true;
+    } else if (ch === separator) {
+      parts.push(input.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(input.slice(start));
+  return parts;
 }

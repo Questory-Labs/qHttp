@@ -29,12 +29,13 @@ export function useAction<TData = unknown, TInput = void>(
       setError(null);
       setInput(vars);
 
-      const rollbacks: Array<[ResourceId, unknown]> = [];
+      const rollbacks: Array<[ResourceId, unknown, unknown]> = [];
       const optimistic = optionsRef.current.optimistic?.(vars) ?? [];
       for (const [id, updater] of optimistic) {
         const previous = store.peek(id);
-        rollbacks.push([id, previous]);
-        store.push(id, updater(previous));
+        const applied = updater(previous);
+        rollbacks.push([id, previous, applied]);
+        store.push(id, applied);
       }
 
       try {
@@ -49,7 +50,9 @@ export function useAction<TData = unknown, TInput = void>(
         await optionsRef.current.onSuccess?.(result, vars);
         return result;
       } catch (err) {
-        for (const [id, previous] of rollbacks.reverse()) {
+        for (const [id, previous, applied] of rollbacks.reverse()) {
+          // A newer write replaced our optimistic value; keep it.
+          if (store.peek(id) !== applied) continue;
           if (previous === undefined) store.drop(id);
           else store.push(id, previous);
         }

@@ -4,10 +4,13 @@ import type { AuthConfig, Middleware } from '../core/types.js';
 import { isQHttpError } from '../errors/qhttp-error.js';
 
 export interface AuthMiddlewareDeps {
-  /** Shared single-flight slot so concurrent 401s trigger one refresh. */
-  refreshState: { pending?: Promise<string | void> };
-  /** Persist a refreshed static bearer token on the owning client. */
-  onToken?: (token: string) => void;
+  /**
+   * Shared single-flight slots keyed by refresh callback, so concurrent 401s
+   * for one credential trigger one refresh and other credentials never share it.
+   */
+  refreshState: Map<RefreshRun, Promise<string | void>>;
+  /** Persist a refreshed bearer token; `auth` is the config that was refreshed. */
+  onToken?: (token: string, auth: AuthConfig) => void;
 }
 
 /**
@@ -36,10 +39,11 @@ export function createAuthMiddleware(deps: AuthMiddlewareDeps): Middleware {
         throw error;
       }
 
+      const auth = ctx.auth;
       const token = await singleFlight(deps.refreshState, refresh.run);
-      if (typeof token === 'string' && ctx.auth.type === 'bearer') {
-        ctx.auth = { ...ctx.auth, token };
-        deps.onToken?.(token);
+      if (typeof token === 'string' && auth.type === 'bearer') {
+        ctx.auth = { ...auth, token };
+        deps.onToken?.(token, auth);
       }
 
       ctx.state.authRefreshed = true;
@@ -54,14 +58,18 @@ function refreshFor(auth: AuthConfig) {
   return auth.type === 'basic' ? undefined : auth.refresh;
 }
 
+type RefreshRun = () => Promise<string | void>;
+
 async function singleFlight(
-  state: { pending?: Promise<string | void> },
-  run: () => Promise<string | void>,
+  state: Map<RefreshRun, Promise<string | void>>,
+  run: RefreshRun,
 ): Promise<string | void> {
-  if (!state.pending) {
-    state.pending = run().finally(() => {
-      state.pending = undefined;
+  let pending = state.get(run);
+  if (!pending) {
+    pending = run().finally(() => {
+      state.delete(run);
     });
+    state.set(run, pending);
   }
-  return state.pending;
+  return pending;
 }

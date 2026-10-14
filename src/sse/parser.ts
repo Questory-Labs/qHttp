@@ -11,14 +11,27 @@ export interface SseMessage {
  * Incremental text/event-stream parser (WHATWG EventSource algorithm).
  * Feed chunks with `push`; `end` flushes a trailing event without a blank line.
  */
-export function createSseParser(onMessage: (message: SseMessage) => void) {
+export interface SseParserHooks {
+  /** A valid `retry:` field was parsed, whether or not the frame carries data. */
+  onRetry?: (retry: number) => void;
+  /** An event frame ended with an `id` set, whether or not it carried data. */
+  onId?: (id: string) => void;
+}
+
+export function createSseParser(
+  onMessage: (message: SseMessage) => void,
+  hooks: SseParserHooks = {},
+) {
   let buffer = '';
   let event = '';
   let data: string[] = [];
   let id: string | undefined;
   let retry: number | undefined;
+  let sawField = false;
 
   const dispatch = () => {
+    if (id !== undefined && sawField) hooks.onId?.(id);
+    sawField = false;
     if (data.length > 0) {
       onMessage({ event: event || 'message', data: data.join('\n'), id, retry });
     }
@@ -34,6 +47,7 @@ export function createSseParser(onMessage: (message: SseMessage) => void) {
     }
     if (line.startsWith(':')) return;
 
+    sawField = true;
     const colon = line.indexOf(':');
     const field = colon === -1 ? line : line.slice(0, colon);
     let value = colon === -1 ? '' : line.slice(colon + 1);
@@ -49,11 +63,12 @@ export function createSseParser(onMessage: (message: SseMessage) => void) {
       case 'id':
         if (!value.includes('\0')) id = value;
         break;
-      case 'retry': {
-        const n = Number(value);
-        if (Number.isInteger(n) && n >= 0) retry = n;
+      case 'retry':
+        if (/^[0-9]+$/.test(value)) {
+          retry = Number(value);
+          hooks.onRetry?.(retry);
+        }
         break;
-      }
       default:
         break;
     }

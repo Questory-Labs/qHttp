@@ -69,7 +69,7 @@ export class QHttp {
   #progressHandler?: (event: ProgressEvent) => void;
   #active = new Set<ComposedSignal>();
   #inflight = new Map<string, Promise<QHttpResult>>();
-  #refreshState: { pending?: Promise<string | void> } = {};
+  #refreshState = new Map<() => Promise<string | void>, Promise<string | void>>();
 
   constructor(config: QHttpConfig = {}) {
     this.#config = {
@@ -443,9 +443,10 @@ export class QHttp {
       ...this.#middleware,
       createAuthMiddleware({
         refreshState: this.#refreshState,
-        onToken: (token) => {
+        onToken: (token, refreshed) => {
+          // Only persist for the client's own credentials, never per-call auth.
           const auth = this.#config.auth;
-          if (auth?.type === 'bearer') this.#config.auth = { ...auth, token };
+          if (auth === refreshed && auth.type === 'bearer') this.#config.auth = { ...auth, token };
         },
       }),
       createCacheMiddleware({ config: this.#config, options: callOptions, hooks: this.#hooks }),

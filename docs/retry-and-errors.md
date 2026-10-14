@@ -70,7 +70,7 @@ try {
 }
 ```
 
-`error.request` never contains credentials or bodies; `JSON.stringify(error)` is safe to log.
+`error.request` never contains credentials or request bodies. `JSON.stringify(error)` also includes `issues`, which can echo values from the response body, so don't assume a serialized error is safe to log when responses may carry sensitive data.
 
 ### Error codes
 

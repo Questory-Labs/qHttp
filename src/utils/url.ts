@@ -12,6 +12,13 @@ export function isAbsoluteUrl(value: string): boolean {
 export function joinUrl(base: string | undefined, path: string): string {
   if (!base) return path;
   if (!path) return base;
+  if (path.startsWith('//')) {
+    try {
+      return new URL(path, base).href;
+    } catch {
+      return path;
+    }
+  }
   if (isAbsoluteUrl(path)) return path;
   const normalizedBase = base.endsWith('/') ? base.slice(0, -1) : base;
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;

@@ -16,7 +16,8 @@ export function stableStringify(value: unknown): string {
 function sortKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeys);
   if (value && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
-    const out: Record<string, unknown> = {};
+    // Null prototype so a `__proto__` key stays an own, serialized property.
+    const out: Record<string, unknown> = Object.create(null);
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
       out[key] = sortKeys((value as Record<string, unknown>)[key]);
     }

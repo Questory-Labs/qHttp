@@ -318,6 +318,8 @@ export class ResourceStore {
         if (entry.pushSeq === pushSeq) {
           entry.value = value;
           entry.updatedAt = Date.now();
+        } else {
+          value = entry.value as T;
         }
         entry.error = null;
         entry.stale = false;

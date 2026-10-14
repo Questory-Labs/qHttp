@@ -177,7 +177,8 @@ export class QEventSource implements AsyncIterable<SseMessage> {
     };
     this.on('message', onMessage);
     this.on('close', onClose);
-    if (this.#state === 'closed' && !this.#closed) this.connect();
+    if (this.#closed) done = true;
+    else if (this.#state === 'closed') this.connect();
     try {
       while (!done || queue.length > 0) {
         if (queue.length === 0) {
@@ -275,13 +276,21 @@ export class QEventSource implements AsyncIterable<SseMessage> {
     this.#setState('open');
     for (const fn of this.#listeners.open) fn();
 
-    const parser = createSseParser((message) => {
-      if (message.id !== undefined) this.#lastEventId = message.id;
-      if (message.retry !== undefined) this.#serverRetry = message.retry;
-      for (const fn of this.#listeners.message) fn(message);
-      const named = this.#named.get(message.event);
-      if (named) for (const fn of named) fn(message);
-    });
+    const parser = createSseParser(
+      (message) => {
+        for (const fn of this.#listeners.message) fn(message);
+        const named = this.#named.get(message.event);
+        if (named) for (const fn of named) fn(message);
+      },
+      {
+        onId: (id) => {
+          this.#lastEventId = id;
+        },
+        onRetry: (retry) => {
+          this.#serverRetry = retry;
+        },
+      },
+    );
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();

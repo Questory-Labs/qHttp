@@ -38,15 +38,17 @@ export function mockResponse(body?: unknown, init: MockResponseInit = {}): RawRe
     status,
     statusText: init.statusText ?? defaultStatusText(status),
     headers,
-    body:
-      bytes.byteLength > 0
+    // Fresh stream per access so a mock response can be read more than once.
+    get body() {
+      return bytes.byteLength > 0
         ? new ReadableStream<Uint8Array>({
             start(controller) {
-              controller.enqueue(bytes);
+              controller.enqueue(bytes.slice());
               controller.close();
             },
           })
-        : null,
+        : null;
+    },
     arrayBuffer: async () => bytes.buffer.slice(0),
     json: async () => JSON.parse(text()),
     text: async () => text(),
