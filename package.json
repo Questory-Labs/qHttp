@@ -3,6 +3,10 @@
   "version": "0.3.0",
   "description": "Fluent, middleware-based HTTP client with caching, retries, rate limiting, WebSocket + SSE clients and React resource hooks",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Questory-Labs/qHttp.git"
+  },
   "type": "module",
   "sideEffects": false,
   "engines": {
