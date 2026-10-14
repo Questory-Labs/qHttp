@@ -1,7 +1,7 @@
 {
   "name": "@questorylabs/qhttp",
-  "version": "0.2.1",
-  "description": "Fluent, extensible HTTP + WebSocket client",
+  "version": "0.3.0",
+  "description": "Fluent, middleware-based HTTP client with caching, retries, rate limiting, WebSocket + SSE clients and React resource hooks",
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
@@ -20,35 +20,91 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
-    },
-    "./ws": {
-      "types": "./dist/ws.d.ts",
-      "import": "./dist/ws.js",
-      "require": "./dist/ws.cjs"
-    },
-    "./http2": {
-      "types": "./dist/http2.d.ts",
-      "import": "./dist/http2.js",
-      "require": "./dist/http2.cjs"
-    },
-    "./http-cache": {
-      "types": "./dist/http-cache.d.ts",
-      "import": "./dist/http-cache.js",
-      "require": "./dist/http-cache.cjs"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     },
     "./react": {
-      "types": "./dist/react.d.ts",
-      "import": "./dist/react.js",
-      "require": "./dist/react.cjs"
-    }
+      "import": {
+        "types": "./dist/react.d.ts",
+        "default": "./dist/react.js"
+      },
+      "require": {
+        "types": "./dist/react.d.cts",
+        "default": "./dist/react.cjs"
+      }
+    },
+    "./resource": {
+      "import": {
+        "types": "./dist/resource.d.ts",
+        "default": "./dist/resource.js"
+      },
+      "require": {
+        "types": "./dist/resource.d.cts",
+        "default": "./dist/resource.cjs"
+      }
+    },
+    "./ws": {
+      "import": {
+        "types": "./dist/ws.d.ts",
+        "default": "./dist/ws.js"
+      },
+      "require": {
+        "types": "./dist/ws.d.cts",
+        "default": "./dist/ws.cjs"
+      }
+    },
+    "./sse": {
+      "import": {
+        "types": "./dist/sse.d.ts",
+        "default": "./dist/sse.js"
+      },
+      "require": {
+        "types": "./dist/sse.d.cts",
+        "default": "./dist/sse.cjs"
+      }
+    },
+    "./http2": {
+      "import": {
+        "types": "./dist/http2.d.ts",
+        "default": "./dist/http2.js"
+      },
+      "require": {
+        "types": "./dist/http2.d.cts",
+        "default": "./dist/http2.cjs"
+      }
+    },
+    "./http-cache": {
+      "import": {
+        "types": "./dist/http-cache.d.ts",
+        "default": "./dist/http-cache.js"
+      },
+      "require": {
+        "types": "./dist/http-cache.d.cts",
+        "default": "./dist/http-cache.cjs"
+      }
+    },
+    "./testing": {
+      "import": {
+        "types": "./dist/testing.d.ts",
+        "default": "./dist/testing.js"
+      },
+      "require": {
+        "types": "./dist/testing.d.cts",
+        "default": "./dist/testing.cjs"
+      }
+    },
+    "./package.json": "./package.json"
   },
   "peerDependencies": {
+    "http-cache-semantics": "^4.0.0",
     "react": ">=18.0.0",
-    "ws": "^8.0.0",
-    "http-cache-semantics": "^4.0.0"
+    "ws": "^8.0.0"
   },
   "peerDependenciesMeta": {
     "react": {
@@ -64,27 +120,72 @@
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "bench": "vitest bench test/bench",
     "bench:hot": "vitest bench test/bench/hot-path.bench.ts",
     "bench:compare": "vitest bench test/bench/compare.bench.ts",
-    "size": "size-limit"
+    "size": "size-limit",
+    "check:exports": "publint && attw --pack . --profile node16",
+    "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm build && pnpm size && pnpm check:exports"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@eslint/js": "^10.0.1",
     "@size-limit/file": "^11.1.6",
+    "@testing-library/react": "^16.3.0",
     "@types/http-cache-semantics": "^4.2.0",
     "@types/node": "^22.10.2",
-    "@vitest/coverage-v8": "^2.1.8",
-    "@testing-library/react": "^16.3.0",
     "@types/react": "^19.2.0",
+    "@vitest/coverage-v8": "^2.1.8",
+    "eslint": "^10.12.0",
+    "globals": "^17.13.0",
     "http-cache-semantics": "^4.2.0",
     "jsdom": "^26.1.0",
+    "publint": "^0.3.25",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "size-limit": "^11.1.6",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",
+    "typescript-eslint": "^8.71.2",
     "vitest": "^2.1.8"
+  },
+  "keywords": [
+    "http",
+    "fetch",
+    "client",
+    "websocket",
+    "sse",
+    "cache",
+    "retry",
+    "react",
+    "middleware"
+  ],
+  "typesVersions": {
+    "*": {
+      "react": [
+        "./dist/react.d.ts"
+      ],
+      "resource": [
+        "./dist/resource.d.ts"
+      ],
+      "ws": [
+        "./dist/ws.d.ts"
+      ],
+      "sse": [
+        "./dist/sse.d.ts"
+      ],
+      "http2": [
+        "./dist/http2.d.ts"
+      ],
+      "http-cache": [
+        "./dist/http-cache.d.ts"
+      ],
+      "testing": [
+        "./dist/testing.d.ts"
+      ]
+    }
   }
 }

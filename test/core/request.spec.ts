@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { QHttp } from '../../src/core/QHttp.js';
 import type { HttpAdapter, RawResponseLike } from '../../src/core/types.js';
-import { QHttpError } from '../../src/errors/qhttp-error.js';
 
 function mockResponse(body: unknown, init: Partial<RawResponseLike> = {}): RawResponseLike {
   const json = JSON.stringify(body);

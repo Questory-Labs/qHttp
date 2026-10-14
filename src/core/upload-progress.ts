@@ -86,8 +86,10 @@ function wrapFormDataWithUploadProgress(
 
   if (!request.body) return undefined;
 
+  // Each serialization generates a fresh boundary, so the header must always
+  // follow the body that will actually be sent (retries re-serialize).
   const contentType = request.headers.get('content-type');
-  if (contentType && !hasHeader(headers, 'content-type')) {
+  if (contentType) {
     setHeader(headers, 'content-type', contentType);
   }
 
@@ -194,7 +196,6 @@ function readContentLength(headers: Map<string, string>): number | undefined {
 }
 
 function ensureContentLength(headers: Map<string, string>, length: number): void {
-  if (!hasHeader(headers, 'content-length')) {
-    setHeader(headers, 'content-length', String(length));
-  }
+  // Always reflect the body being sent; a retry may serialize a different length.
+  setHeader(headers, 'content-length', String(length));
 }

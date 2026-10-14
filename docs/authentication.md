@@ -1,67 +1,72 @@
 # Authentication
 
-QHttp supports Bearer and Basic auth via `setAuth()` or manual headers in `preRequest`.
-
-## Bearer token
+## Bearer
 
 ```typescript
-client.setAuth({ type: 'bearer', token: 'your-access-token' });
-
-// Sets: Authorization: Bearer your-access-token
-await client.get('/protected');
+client.setAuth({ type: 'bearer', token: 'static-key' });
+client.setAuth({ type: 'bearer', token: () => tokenStore.current });       // read on every request
+client.setAuth({ type: 'bearer', token: async () => await vault.token() }); // async provider
 ```
 
-## Basic auth
+## Refresh on 401
 
 ```typescript
 client.setAuth({
-  type: 'basic',
-  username: 'api',
-  password: 'secret',
-});
-
-// Sets: Authorization: Basic base64(api:secret)
-```
-
-## Dynamic tokens (recommended)
-
-Static `setAuth` is fine for long-lived keys. For expiring tokens, use `preRequest`:
-
-```typescript
-client.preRequest(async (ctx) => {
-  const token = await tokenStore.getValidToken();
-  ctx.headers.set('authorization', `Bearer ${token}`);
+  type: 'bearer',
+  token: () => session.accessToken,
+  refresh: {
+    on: [401],                       // default
+    run: async () => {
+      await session.refresh();       // update your store...
+      return session.accessToken;    // ...or return the new token for static configs
+    },
+  },
 });
 ```
 
-## Auth helper utilities
+On a matching status the client runs `refresh.run` once (concurrent requests share the in-flight refresh), re-applies credentials and replays the request once. A second failure propagates. Requests with stream bodies are not replayed.
+
+## Basic
 
 ```typescript
-import { applyAuth, createAuthPreRequestHook, toBase64 } from '@questorylabs/qhttp';
-
-const hook = createAuthPreRequestHook({ type: 'bearer', token: 'x' });
-// equivalent to client.preRequest(hook)
+client.setAuth({ type: 'basic', username: 'api', password: 'secret' });
 ```
-
-`applyAuth` mutates a `RequestContext` in place — useful in custom pipelines.
 
 ## Custom schemes
 
-For API keys, HMAC, or mTLS metadata in headers:
-
 ```typescript
-client.preRequest((ctx) => {
-  ctx.headers.set('x-api-key', process.env.API_KEY!);
+client.setAuth({
+  type: 'custom',
+  apply: async (ctx) => {
+    ctx.headers.set('x-api-key', await keys.current());
+    ctx.headers.set('x-signature', sign(ctx.method, ctx.resolvedUrl));
+  },
+  refresh: { on: [401, 403], run: () => keys.rotate() },
 });
 ```
 
-QHttp does not terminate TLS or attach certificates — configure that at the adapter / Node layer.
+## Per call
+
+```typescript
+await client.get('/public', { auth: false });
+await client.get('/admin', { auth: { type: 'bearer', token: adminToken } });
+```
+
+## Cache interaction
+
+Authenticated responses are keyed per credential (the `Authorization` header is hashed into the cache key). See [Caching](./caching.md#cache-keys).
+
+## Utilities
+
+```typescript
+import { applyAuth, createAuthPreRequestHook, resolveToken, toBase64 } from '@questorylabs/qhttp';
+```
+
+`applyAuth(ctx, auth)` is async and mutates the context in place.
 
 ## Guidelines
 
-1. **Never log** full tokens in `postRequest` or error handlers.
-2. **Prefer preRequest** when tokens refresh — `setAuth` is not re-evaluated automatically.
-3. **Basic auth** encodes credentials but does not encrypt — use HTTPS only.
-4. **Per-request override** — `preRequest` can branch on `ctx.url` or `ctx.method`.
-
-See [Hooks](./hooks.md) for more interceptor patterns.
+1. **Never log tokens.** `QHttpError` already redacts `authorization`, `cookie` and API-key headers.
+2. **Prefer token providers** over static strings for anything that expires.
+3. **Basic auth** encodes, it does not encrypt; HTTPS only.
+4. **One refresh owner.** Put refresh on the client, not in app code around every call.

@@ -1,8 +1,25 @@
-import type { FinalRequest, HttpAdapter, RawResponseLike } from '../core/types.js';
+import type { FetchOptions, FinalRequest, HttpAdapter, RawResponseLike } from '../core/types.js';
+
+export interface FetchAdapterOptions {
+  /** Defaults merged under every request's `init` (e.g. `{ credentials: 'include' }`). */
+  defaults?: FetchOptions;
+  /** Custom fetch implementation (undici, a polyfill, or a test double). */
+  fetch?: typeof fetch;
+}
 
 export class FetchAdapter implements HttpAdapter {
+  readonly #defaults?: FetchOptions;
+  readonly #fetch?: typeof fetch;
+
+  constructor(options: FetchAdapterOptions = {}) {
+    this.#defaults = options.defaults;
+    this.#fetch = options.fetch;
+  }
+
   async send(request: FinalRequest): Promise<RawResponseLike> {
     const init: RequestInit & { duplex?: 'half' } = {
+      ...this.#defaults,
+      ...request.init,
       method: request.method,
       headers: request.headers,
       body: request.body,
@@ -13,12 +30,13 @@ export class FetchAdapter implements HttpAdapter {
       init.duplex = request.duplex;
     }
 
-    const response = await fetch(request.url, init);
+    const doFetch = this.#fetch ?? globalThis.fetch;
+    const response = await doFetch(request.url, init);
     return wrapFetchResponse(response);
   }
 }
 
-function wrapFetchResponse(response: Response): RawResponseLike {
+export function wrapFetchResponse(response: Response): RawResponseLike {
   return {
     ok: response.ok,
     status: response.status,
@@ -29,6 +47,7 @@ function wrapFetchResponse(response: Response): RawResponseLike {
     json: () => response.json(),
     text: () => response.text(),
     blob: () => response.blob(),
+    raw: response,
   };
 }
 

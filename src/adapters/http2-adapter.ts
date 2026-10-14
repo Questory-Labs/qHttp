@@ -12,17 +12,32 @@ interface Http2Session {
   request(headers: Record<string, string>): Http2ClientRequest;
   close: () => void;
   unref?: () => void;
+  setTimeout?: (ms: number, callback: () => void) => void;
   on: (event: string, listener: (...args: unknown[]) => void) => void;
   destroyed?: boolean;
   closed?: boolean;
 }
 
 interface Http2Module {
-  connect: (
-    authority: string,
-    options?: { rejectUnauthorized?: boolean },
-  ) => Http2Session;
+  connect: (authority: string, options?: Record<string, unknown>) => Http2Session;
 }
+
+export interface Http2AdapterOptions {
+  /** Close idle sessions after this many ms. Default 60s. `0` disables. */
+  sessionIdleMs?: number;
+  /** Options forwarded to `http2.connect` (TLS `ca`, `rejectUnauthorized`, `settings`...). */
+  connectOptions?: Record<string, unknown>;
+}
+
+/** Connection-specific headers that HTTP/2 forbids (RFC 9113 §8.2.2). */
+const FORBIDDEN_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-connection',
+  'transfer-encoding',
+  'upgrade',
+  'host',
+]);
 
 export async function serializeHttp2Body(
   body: FinalRequest['body'],
@@ -53,9 +68,25 @@ export async function serializeHttp2Body(
   });
 }
 
+export function filterHttp2Headers(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    const lower = key.toLowerCase();
+    if (lower.startsWith(':') || FORBIDDEN_HEADERS.has(lower)) continue;
+    if (lower === 'te' && value.toLowerCase() !== 'trailers') continue;
+    out[lower] = value;
+  }
+  return out;
+}
+
 export class Http2Adapter implements HttpAdapter {
   readonly #sessions = new Map<string, Http2Session>();
+  readonly #options: Http2AdapterOptions;
   #http2Module: Http2Module | null = null;
+
+  constructor(options: Http2AdapterOptions = {}) {
+    this.#options = options;
+  }
 
   async send(request: FinalRequest): Promise<RawResponseLike> {
     if (request.signal?.aborted) {
@@ -73,7 +104,7 @@ export class Http2Adapter implements HttpAdapter {
         ':path': `${url.pathname}${url.search}`,
         ':scheme': url.protocol.replace(':', ''),
         ':authority': url.host,
-        ...request.headers,
+        ...filterHttp2Headers(request.headers),
       };
 
       const req = session.request(headers);
@@ -116,10 +147,15 @@ export class Http2Adapter implements HttpAdapter {
 
       req.on('end', () => {
         const bodyBuffer = Buffer.concat(chunks);
+        const bytes = new Uint8Array(
+          bodyBuffer.buffer,
+          bodyBuffer.byteOffset,
+          bodyBuffer.byteLength,
+        );
         const body = bodyBuffer.length
           ? new ReadableStream<Uint8Array>({
               start(controller) {
-                controller.enqueue(new Uint8Array(bodyBuffer));
+                controller.enqueue(bytes);
                 controller.close();
               },
             })
@@ -132,24 +168,20 @@ export class Http2Adapter implements HttpAdapter {
             statusText: '',
             headers: responseHeaders,
             body,
-            arrayBuffer: async () => {
-              const copy = bodyBuffer.buffer.slice(
+            arrayBuffer: async () =>
+              bodyBuffer.buffer.slice(
                 bodyBuffer.byteOffset,
                 bodyBuffer.byteOffset + bodyBuffer.byteLength,
-              );
-              return copy;
-            },
+              ),
             json: async () => JSON.parse(bodyBuffer.toString('utf-8')),
             text: async () => bodyBuffer.toString('utf-8'),
-            blob: async () => new Blob([bodyBuffer]),
+            blob: async () => new Blob([bytes]),
           }),
         );
       });
 
       req.on('error', ((error: unknown) => {
-        settle(() =>
-          reject(error instanceof Error ? error : new Error(String(error))),
-        );
+        settle(() => reject(error instanceof Error ? error : new Error(String(error))));
       }) as (...args: unknown[]) => void);
 
       if (bodyPayload !== undefined) {
@@ -170,12 +202,24 @@ export class Http2Adapter implements HttpAdapter {
     }
 
     if (!this.#http2Module) {
-      const mod = (await import('node:http2')) as Http2Module;
+      const mod = (await import('node:http2')) as unknown as Http2Module;
       this.#http2Module = mod;
     }
 
-    const session = this.#http2Module.connect(origin);
+    const session = this.#http2Module.connect(origin, this.#options.connectOptions);
     session.unref?.();
+
+    const idleMs = this.#options.sessionIdleMs ?? 60_000;
+    if (idleMs > 0 && typeof session.setTimeout === 'function') {
+      session.setTimeout(idleMs, () => {
+        evict();
+        try {
+          session.close();
+        } catch {
+          // ignore
+        }
+      });
+    }
 
     const evict = () => {
       if (this.#sessions.get(origin) === session) {

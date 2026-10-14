@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { withRetry } from '../../src/retry/retry.js';
 import { QHttpError } from '../../src/errors/qhttp-error.js';
 

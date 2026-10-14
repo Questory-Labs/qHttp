@@ -1,59 +1,47 @@
 # Hooks
 
-Hooks let you intercept the request lifecycle without subclassing `QHttp`. Register with chainable methods or the generic `.hook(phase, fn)` API.
+Hooks intercept the request lifecycle without subclassing `QHttp`. For wrapping a whole call (timing, tracing, fallbacks) see [Middleware](./middleware.md).
 
-## Hook phases
+## Phases
 
 | Phase | When | Typical use |
 |-------|------|-------------|
-| `preRequest` | Before cache lookup / network | Auth headers, logging, URL tweaks |
-| `preCache` | Before cache read | Metrics, debug |
-| `postCache` | After cache write | Audit trail |
-| `postRequest` | After success (network or cache) | Transform `data`, normalize |
-| `onError` | On failure | Recovery, fallback responses |
-| `onRetry` | Before each retry attempt | Logging, backoff metrics |
-| custom string | Same as `hook('myPhase', fn)` | Domain-specific pipelines |
+| `preRequest` | After the context is built, before middleware | Headers, URL tweaks, logging |
+| `preCache` | Before the cache read (`ctx.state.cacheKey` set) | Metrics |
+| `postCache` | Before the cache write | Audit |
+| `postRequest` | After success (network or cache) | Transform `data` |
+| `onError` | On failure, after retries | Recovery, fallback responses |
+| `onRetry` | Before each retry sleep | Logging, metrics |
+| custom string | `hook('myPhase', fn)` | Your own pipelines |
 
 ## preRequest
 
-Mutate the request context or return a partial patch:
-
 ```typescript
 client.preRequest((ctx) => {
-  ctx.headers.set('authorization', `Bearer ${getToken()}`);
+  ctx.headers.set('x-request-id', ctx.requestId);
   ctx.headers.set('x-timezone', Intl.DateTimeFormat().resolvedOptions().timeZone);
 });
 
-// Return a patch (merged with context)
-client.preRequest(() => ({
-  queryParams: { _ts: Date.now() },
-}));
+client.preRequest(() => ({ meta: { source: 'web' } })); // partial patch, shallow-merged
 ```
 
-`RequestContext` fields: `baseUrl`, `url`, `resolvedUrl`, `method`, `headers` (Map), `queryParams`, `body`, `timeout`, `responseType`, `signal`, `macros`, `auth`.
+`RequestContext` fields: `requestId`, `startedAt`, `baseUrl`, `url`, `resolvedUrl`, `method`, `headers` (Map), `queryParams`, `body`, `timeout`, `deadline`, `responseType`, `signal`, `macros`, `auth`, `fetchOptions`, `parse`, `validateStatus`, `meta`, `state`.
 
-Hooks run in registration order; patches are shallow-merged.
+Changing `url` or `queryParams` in a hook does not rebuild `resolvedUrl`; set `resolvedUrl` directly when rewriting targets.
 
 ## postRequest
 
-Transform the result after a successful response:
-
 ```typescript
 client.postRequest(({ result, ctx }) => {
-  if (result.data && typeof result.data === 'object') {
-    result.data = {
-      ...result.data,
-      _fetchedAt: Date.now(),
-    };
-  }
+  result.data = { ...(result.data as object), fetchedAt: result.timing.endedAt };
 });
 ```
 
-Runs for cache hits too — your transform applies to cached data.
+Runs for cache hits too.
 
 ## onError
 
-Recover from errors by returning a synthetic `QHttpResult`:
+Return a `QHttpResult` to recover:
 
 ```typescript
 client.onError((error) => {
@@ -67,52 +55,37 @@ client.onError((error) => {
       request: { url: '', method: 'GET', headers: {} },
       fetchStatus: 'success',
       fromCache: false,
+      requestId: error.requestId ?? '',
+      timing: { startedAt: 0, endedAt: 0, durationMs: 0, attempts: 0 },
     };
   }
 });
 ```
 
-First recovery hook that returns a result wins. Otherwise the error propagates (or becomes a failed result when `throwOnError: false`).
+The first hook that returns a result wins; otherwise the error propagates (or becomes a failed result when `throwOnError: false`).
 
 ## onRetry
 
 ```typescript
-client
-  .setRetry({ retries: 3, backoff: 'exponential' })
-  .onRetry(({ attempt, error }) => {
-    console.warn(`Retry ${attempt}`, error);
-  });
+client.setRetry({ retries: 3 }).onRetry(({ attempt, error }) => metrics.retry(attempt, error));
 ```
 
-## Custom phases
+## Custom phases and HookManager
 
 ```typescript
-client.hook('beforeTransform', (ctx) => {
-  // integrate with your own pipeline
-});
-```
+client.hook('beforeTransform', (ctx) => { /* ... */ });
 
-Use `HookManager` directly if building middleware outside `QHttp`:
-
-```typescript
 import { HookManager } from '@questorylabs/qhttp';
-
 const hooks = new HookManager();
 hooks.add('preRequest', (ctx) => ctx);
 ```
 
-## Clone preserves hooks
-
-```typescript
-const child = client.clone(); // copies hook registrations
-```
+`clone()` copies hook registrations and middleware.
 
 ## Guidelines
 
-1. **Keep preRequest fast** — it runs on every request including cache hits' post path setup.
-2. **Don't throw in hooks** unless you intend to fail the request — uncaught errors bubble up.
-3. **onError recovery** is for controlled fallbacks, not silent swallowing of all errors.
-4. **postRequest mutations** affect what callers receive and what you might re-read from cache on the next hit.
-5. **Auth in preRequest** works alongside `setAuth()` — both apply; last writer on headers wins for duplicates.
-
-See [Authentication](./authentication.md) for built-in auth helpers.
+1. **Keep `preRequest` fast**; it runs before every cache lookup.
+2. **Don't throw in hooks** unless you intend to fail the request.
+3. **Use `onError` for controlled fallbacks**, not to silence every failure.
+4. **Mutations in `postRequest`** affect what callers receive and what is cached.
+5. **`setAuth` plus `preRequest`** both apply; the last writer of a header wins.

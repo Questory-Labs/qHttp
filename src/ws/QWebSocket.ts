@@ -1,9 +1,5 @@
 import { BrowserWSAdapter } from './browser-ws-adapter.js';
-import type {
-  WSCloseEvent,
-  WSMessageEvent,
-  WSReadyState,
-} from './ws-adapter.interface.js';
+import type { WSCloseEvent, WSMessageEvent, WSReadyState } from './ws-adapter.interface.js';
 import { WS_OPEN } from './ws-adapter.interface.js';
 import type { WSAdapter, WSAdapterSocket } from './ws-adapter.interface.js';
 import { sleep } from '../utils/abortable.js';
@@ -13,12 +9,19 @@ export interface ReconnectOptions {
   delay?: number;
   backoff?: 'fixed' | 'exponential';
   maxDelay?: number;
+  /** Randomize delay between 50% and 100% of the computed value. */
+  jitter?: boolean;
 }
 
 export interface HeartbeatOptions {
   intervalMs: number;
   message?: string | ArrayBuffer;
   pongTimeoutMs?: number;
+  /**
+   * Which incoming frames count as a pong. Default: any frame.
+   * Pass a string to match an exact text frame, or a predicate.
+   */
+  isPong?: string | ((data: WSMessageEvent['data']) => boolean);
 }
 
 type EventMap = {
@@ -27,6 +30,16 @@ type EventMap = {
   error: (error: Error) => void;
   close: (event: WSCloseEvent) => void;
   reconnect: (attempt: number) => void;
+  /** Fired when a connection is re-established after a reconnect. */
+  reconnected: (attempt: number) => void;
+  state: (state: WSReadyState) => void;
+};
+
+type ListenerSets = { [K in keyof EventMap]: Set<EventMap[K]> };
+
+type Bound = {
+  socket: WSAdapterSocket;
+  handlers: Array<['open' | 'message' | 'error' | 'close', (event: unknown) => void]>;
 };
 
 export class QWebSocket {
@@ -34,13 +47,15 @@ export class QWebSocket {
   #protocols?: string | string[];
   #headers: Record<string, string> = {};
   #adapter: WSAdapter = new BrowserWSAdapter();
-  #socket?: WSAdapterSocket;
-  #listeners: { [K in keyof EventMap]: Set<EventMap[K]> } = {
+  #bound?: Bound;
+  #listeners: ListenerSets = {
     open: new Set(),
     message: new Set(),
     error: new Set(),
     close: new Set(),
     reconnect: new Set(),
+    reconnected: new Set(),
+    state: new Set(),
   };
   #sendQueue: Array<string | ArrayBuffer | Blob> = [];
   readonly #queueLimit: number;
@@ -49,8 +64,10 @@ export class QWebSocket {
   #heartbeatTimer?: ReturnType<typeof setInterval>;
   #pongTimer?: ReturnType<typeof setTimeout>;
   #reconnectAttempts = 0;
+  #wasReconnecting = false;
   #manualClose = false;
   #state: WSReadyState = 'closed';
+  #reconnectAbort?: AbortController;
 
   constructor(url: string, options: { queueLimit?: number } = {}) {
     this.#url = url;
@@ -82,29 +99,52 @@ export class QWebSocket {
     return this;
   }
 
-  onOpen(fn: EventMap['open']): this {
-    this.#listeners.open.add(fn);
+  on<K extends keyof EventMap>(event: K, fn: EventMap[K]): this {
+    this.#listeners[event].add(fn);
     return this;
+  }
+
+  onOpen(fn: EventMap['open']): this {
+    return this.on('open', fn);
   }
 
   onMessage(fn: EventMap['message']): this {
-    this.#listeners.message.add(fn);
-    return this;
+    return this.on('message', fn);
+  }
+
+  /** Text frames parsed as JSON. Non-JSON frames are ignored. */
+  onJson<T = unknown>(fn: (payload: T, event: WSMessageEvent) => void): this {
+    const wrapped: EventMap['message'] = (event) => {
+      if (typeof event.data !== 'string') return;
+      let parsed: T;
+      try {
+        parsed = JSON.parse(event.data) as T;
+      } catch {
+        return;
+      }
+      fn(parsed, event);
+    };
+    return this.on('message', wrapped);
   }
 
   onError(fn: EventMap['error']): this {
-    this.#listeners.error.add(fn);
-    return this;
+    return this.on('error', fn);
   }
 
   onClose(fn: EventMap['close']): this {
-    this.#listeners.close.add(fn);
-    return this;
+    return this.on('close', fn);
   }
 
   onReconnect(fn: EventMap['reconnect']): this {
-    this.#listeners.reconnect.add(fn);
-    return this;
+    return this.on('reconnect', fn);
+  }
+
+  onReconnected(fn: EventMap['reconnected']): this {
+    return this.on('reconnected', fn);
+  }
+
+  onStateChange(fn: EventMap['state']): this {
+    return this.on('state', fn);
   }
 
   off<K extends keyof EventMap>(event: K, fn: EventMap[K]): this {
@@ -116,16 +156,30 @@ export class QWebSocket {
     return this.#state;
   }
 
+  /** Bytes queued on the underlying socket, when the adapter exposes it. */
+  get bufferedAmount(): number {
+    const socket = this.#bound?.socket as { bufferedAmount?: number } | undefined;
+    return socket?.bufferedAmount ?? 0;
+  }
+
+  /** Messages waiting for the socket to open. */
+  get queuedCount(): number {
+    return this.#sendQueue.length;
+  }
+
   connect(): this {
+    if (this.#state === 'open' || this.#state === 'connecting') return this;
     this.#manualClose = false;
+    this.#reconnectAbort?.abort();
     this.#setState('connecting');
     this.#openSocket();
     return this;
   }
 
   send(data: string | ArrayBuffer | Blob): void {
-    if (this.#socket && this.#socket.readyState === WS_OPEN) {
-      this.#socket.send(data);
+    const socket = this.#bound?.socket;
+    if (socket && socket.readyState === WS_OPEN) {
+      socket.send(data);
       return;
     }
 
@@ -142,39 +196,67 @@ export class QWebSocket {
 
   close(code = 1000, reason = ''): void {
     this.#manualClose = true;
+    this.#reconnectAbort?.abort();
     this.#clearHeartbeat();
+    const bound = this.#bound;
+    this.#unbind();
     this.#setState('closing');
-    this.#socket?.close(code, reason);
+    try {
+      bound?.socket.close(code, reason);
+    } catch {
+      // ignore
+    }
     this.#setState('closed');
   }
 
   #openSocket(): void {
-    this.#socket = this.#adapter.connect({
+    this.#unbind();
+    const socket = this.#adapter.connect({
       url: this.#url,
       protocols: this.#protocols,
       headers: this.#headers,
     });
 
+    const bound: Bound = { socket, handlers: [] };
+    this.#bound = bound;
+    const current = () => this.#bound === bound;
+
     const onOpen = () => {
+      if (!current()) return;
+      const attempt = this.#reconnectAttempts;
+      const reconnected = this.#wasReconnecting;
       this.#reconnectAttempts = 0;
+      this.#wasReconnecting = false;
       this.#setState('open');
       this.#flushQueue();
       this.#startHeartbeat();
       for (const fn of this.#listeners.open) fn();
+      if (reconnected) {
+        for (const fn of this.#listeners.reconnected) fn(attempt);
+      }
     };
 
     const onMessage = (event: WSMessageEvent) => {
-      this.#resetPongTimer();
+      if (!current()) return;
+      if (this.#isPong(event.data)) this.#resetPongTimer();
       for (const fn of this.#listeners.message) fn(event);
     };
 
-    const onError = (event: Event) => {
-      const error = event instanceof ErrorEvent ? new Error(event.message) : new Error('WebSocket error');
+    const onError = (event: unknown) => {
+      if (!current()) return;
+      const error =
+        typeof ErrorEvent !== 'undefined' && event instanceof ErrorEvent
+          ? new Error(event.message)
+          : event instanceof Error
+            ? event
+            : new Error('WebSocket error');
       for (const fn of this.#listeners.error) fn(error);
     };
 
-    const onClose = (event: CloseEvent) => {
+    const onClose = (event: WSCloseEvent) => {
+      if (!current()) return;
       this.#clearHeartbeat();
+      this.#unbind();
       const closeEvent: WSCloseEvent = {
         code: event.code,
         reason: event.reason,
@@ -188,17 +270,37 @@ export class QWebSocket {
       }
     };
 
-    this.#socket.addEventListener('open', onOpen as (event: unknown) => void);
-    this.#socket.addEventListener('message', onMessage as (event: unknown) => void);
-    this.#socket.addEventListener('error', onError as (event: unknown) => void);
-    this.#socket.addEventListener('close', onClose as (event: unknown) => void);
+    this.#bind(bound, 'open', onOpen as (event: unknown) => void);
+    this.#bind(bound, 'message', onMessage as (event: unknown) => void);
+    this.#bind(bound, 'error', onError);
+    this.#bind(bound, 'close', onClose as (event: unknown) => void);
+  }
+
+  #bind(bound: Bound, type: Bound['handlers'][number][0], handler: (event: unknown) => void): void {
+    bound.socket.addEventListener(type, handler);
+    bound.handlers.push([type, handler]);
+  }
+
+  #unbind(): void {
+    const bound = this.#bound;
+    if (!bound) return;
+    for (const [type, handler] of bound.handlers) {
+      try {
+        bound.socket.removeEventListener(type, handler);
+      } catch {
+        // ignore
+      }
+    }
+    bound.handlers = [];
+    this.#bound = undefined;
   }
 
   #flushQueue(): void {
-    while (this.#sendQueue.length > 0 && this.#socket?.readyState === WS_OPEN) {
+    const socket = this.#bound?.socket;
+    while (this.#sendQueue.length > 0 && socket?.readyState === WS_OPEN) {
       const item = this.#sendQueue.shift();
       if (item !== undefined) {
-        this.#socket.send(item);
+        socket.send(item);
       }
     }
   }
@@ -213,28 +315,46 @@ export class QWebSocket {
   async #scheduleReconnect(): Promise<void> {
     const opts = this.#reconnect!;
     this.#reconnectAttempts += 1;
+    this.#wasReconnecting = true;
     this.#setState('reconnecting');
     for (const fn of this.#listeners.reconnect) fn(this.#reconnectAttempts);
 
     const base = opts.delay ?? 1000;
-    const delay =
+    let delay =
       opts.backoff === 'exponential'
         ? Math.min(base * 2 ** (this.#reconnectAttempts - 1), opts.maxDelay ?? 30_000)
         : base;
+    if (opts.jitter) delay = delay / 2 + Math.random() * (delay / 2);
 
-    await sleep(delay);
-    if (!this.#manualClose) {
+    const abort = new AbortController();
+    this.#reconnectAbort = abort;
+    try {
+      await sleep(delay, abort.signal);
+    } catch {
+      return;
+    }
+    if (this.#reconnectAbort === abort) this.#reconnectAbort = undefined;
+    if (!this.#manualClose && this.#state === 'reconnecting') {
       this.#openSocket();
     }
   }
 
+  #isPong(data: WSMessageEvent['data']): boolean {
+    const matcher = this.#heartbeat?.isPong;
+    if (matcher === undefined) return true;
+    if (typeof matcher === 'string') return data === matcher;
+    return matcher(data);
+  }
+
   #startHeartbeat(): void {
     if (!this.#heartbeat) return;
+    this.#clearHeartbeat();
 
     this.#heartbeatTimer = setInterval(() => {
-      if (this.#socket?.readyState === WS_OPEN) {
+      const socket = this.#bound?.socket;
+      if (socket?.readyState === WS_OPEN) {
         const message = this.#heartbeat!.message ?? 'ping';
-        this.#socket.send(message);
+        socket.send(message);
         this.#resetPongTimer();
       }
     }, this.#heartbeat.intervalMs);
@@ -244,7 +364,7 @@ export class QWebSocket {
     if (!this.#heartbeat?.pongTimeoutMs) return;
     if (this.#pongTimer) clearTimeout(this.#pongTimer);
     this.#pongTimer = setTimeout(() => {
-      this.#socket?.close(4000, 'Heartbeat timeout');
+      this.#bound?.socket.close(4000, 'Heartbeat timeout');
     }, this.#heartbeat!.pongTimeoutMs);
   }
 
@@ -256,6 +376,8 @@ export class QWebSocket {
   }
 
   #setState(state: WSReadyState): void {
+    if (this.#state === state) return;
     this.#state = state;
+    for (const fn of this.#listeners.state) fn(state);
   }
 }

@@ -1,32 +1,32 @@
 # qHttp documentation
 
-Welcome to the qHttp docs. These guides explain how to build requests, wire hooks, cache responses, handle errors, and use WebSockets — with examples you can copy into your project.
+Guides for building requests, composing middleware, caching, handling errors, realtime transports and the React resource layer.
 
 ## Guides
 
 | Guide | What you'll learn |
 |-------|-------------------|
-| [Getting started](./getting-started.md) | Core concepts, client lifecycle, result objects |
-| [Requests](./requests.md) | URLs, query params, bodies, response types, timeouts |
-| [Caching](./caching.md) | Engines, TTL, keys, conditional cache, static API |
+| [Getting started](./getting-started.md) | Core concepts, per-call options, result objects, status, cancel |
+| [Requests](./requests.md) | URLs, query params, bodies, response types, validation, pagination |
+| [Middleware](./middleware.md) | Pipeline order, writing middleware, built-in steps |
+| [Caching](./caching.md) | TTL and HTTP modes, keys, engines, invalidation |
 | [Hooks](./hooks.md) | Interceptors, transformation, error recovery |
-| [Retry & errors](./retry-and-errors.md) | Retry policies, `QHttpError`, resource/poll backoff |
-| [Authentication](./authentication.md) | Bearer and Basic credentials |
-| [Adapters](./adapters.md) | Fetch, HTTP/2, custom transports |
+| [Retry & errors](./retry-and-errors.md) | Retry, deadline, rate limit, circuit breaker, `QHttpError` |
+| [Authentication](./authentication.md) | Bearer providers, refresh, basic, custom |
+| [Adapters](./adapters.md) | Fetch options, HTTP/2, custom transports |
+| [React](./react.md) | `ResourceStore`, `useResource`, `useAction`, Suspense, pagination, live feeds |
 | [WebSockets](./websockets.md) | `QWebSocket`, reconnect, Node `ws` |
+| [SSE](./sse.md) | `QEventSource`, reconnect, async iteration |
+| [Testing](./testing.md) | `MockAdapter` and `mockResponse` |
 | [API reference](./api-reference.md) | Quick method and type lookup |
-
-### React entry (`@questorylabs/qhttp/react`)
-
-`ResourceProvider`, `useResource`, `useAction`, `useLiveResource`, `useStore`, `ResourceStore` — shared cache with optional `refreshEvery` poll backoff and `refreshOnFocus`. See [Retry & errors](./retry-and-errors.md#resourcestore--useresource).
 
 ## Design principles
 
-1. **Thin over `fetch`** — QHttp wraps transport, parsing, and policy; uncached overhead stays near native `fetch`.
-2. **Two API styles** — chain methods for reusable clients; call setters imperatively when config depends on runtime state.
-3. **Explicit cache** — opt-in TTL cache, not browser HTTP cache semantics.
-4. **Hooks over inheritance** — extend behavior with functions, not subclass trees.
-5. **Runtime agnostic** — same API in Node, browsers, and edge; adapters swap transport details.
+1. **Thin over `fetch`.** QHttp orchestrates transport, parsing and policy; uncached overhead stays near native `fetch`.
+2. **Defaults on the client, overrides per call.** Chain setters for reusable clients; pass options per request. Per-call options never mutate the instance.
+3. **Everything is middleware.** Auth, cache, dedupe, retry, timeout, rate limiting and transport are composable steps; add your own with `use()`.
+4. **Explicit cache.** Opt-in TTL cache with auth-aware keys, or RFC 9111 semantics when responses carry cache headers.
+5. **Runtime agnostic.** Same API in Node, browsers and edge; adapters swap transport details.
 
 ## Minimal example
 
@@ -34,11 +34,11 @@ Welcome to the qHttp docs. These guides explain how to build requests, wire hook
 import { QHttp } from '@questorylabs/qhttp';
 
 const api = new QHttp({ baseUrl: 'https://api.example.com' })
-  .setAuth({ type: 'bearer', token: process.env.API_TOKEN! })
+  .setAuth({ type: 'bearer', token: () => getToken() })
   .setRetry({ retries: 3, backoff: 'exponential', jitter: true })
   .setTimeout(10_000);
 
-const { data } = await api.get<{ items: string[] }>('/items');
+const { data } = await api.get<{ items: string[] }>('/items', { params: { page: 1 } });
 ```
 
 See [Getting started](./getting-started.md) for the full walkthrough.

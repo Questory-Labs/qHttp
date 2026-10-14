@@ -1,203 +1,121 @@
 # Caching
 
-QHttp provides two opt-in cache modes on the same `CacheEngine` backends:
+Two opt-in cache modes on the same `CacheEngine` backends:
 
-| Mode | API | Behavior |
-|------|-----|----------|
-| **TTL** (default) | `.cache()` | Fast key/value store; client-controlled TTL |
-| **HTTP** (RFC 9111) | `.httpCache()` | `Cache-Control`, freshness, `Vary`, validators, conditional revalidation |
-
-Use `.cache()` when you want maximum speed and simple invalidation. Use `.httpCache()` when responses carry standard HTTP cache headers.
+| Mode | API | Behaviour |
+|------|-----|-----------|
+| **TTL** (default) | `.cache()` | Key/value store; client-controlled TTL (5 min default) |
+| **HTTP** (RFC 9111) | `.httpCache()` | `Cache-Control`, freshness, `Vary`, validators, conditional revalidation, SWR |
 
 ## TTL cache
 
 ```typescript
 import { QHttp, MemoryCacheEngine } from '@questorylabs/qhttp';
 
-const cache = new MemoryCacheEngine();
-
 const client = new QHttp({ baseUrl: 'https://api.example.com' })
-  .cache()                    // enable TTL mode
-  .cacheTTL(60_000)           // default TTL: 60s
-  .cacheEngine(cache)         // optional: shared engine
-  .cacheKey('users:{{userId}}')
-  .replaceUrlMacros({ userId: 'u1' });
+  .cache()
+  .cacheTTL(60_000)
+  .cacheEngine(new MemoryCacheEngine({ maxSize: 1_000 }));
 
-const first = await client.get('/users/u1');
-const second = await client.get('/users/u1');
+const first = await client.get('/users/u1');   // network
+const second = await client.get('/users/u1');  // fromCache: true
 
-first.fromCache;  // false — network
-second.fromCache; // true  — cache hit
+await client.get('/users/u1', { cache: false });          // bypass for one call
+await client.get('/reports', { cacheTTL: 5 * 60_000 });   // per-call TTL
 ```
+
+Without `cacheTTL`, entries expire after `DEFAULT_CACHE_TTL_MS` (5 minutes). Pass `Infinity` for no expiry.
 
 ## HTTP cache (RFC 9111)
 
-Requires the optional peer `http-cache-semantics`:
-
-```bash
-pnpm add http-cache-semantics
-```
+Requires the optional peer `http-cache-semantics`.
 
 ```typescript
-const client = new QHttp({ baseUrl: 'https://api.example.com' })
-  .httpCache({ shared: false }) // private user-agent cache (default)
-  .cacheEngine(cache);
-
-const first = await client.get('/users/u1');
-const second = await client.get('/users/u1');
+const client = new QHttp({ baseUrl }).httpCache({ shared: false }).cacheEngine(cache);
 ```
 
-HTTP mode interprets response headers (`Cache-Control`, `ETag`, `Last-Modified`, `Vary`, etc.) and:
+HTTP mode reads `Cache-Control`, `ETag`, `Last-Modified`, `Vary` and more, and:
 
-- Returns fresh responses from cache without network I/O
-- Sends conditional revalidation (`If-None-Match` / `If-Modified-Since`) when stale
-- Reuses cached bodies on `304 Not Modified`
-- Supports `stale-while-revalidate` (returns stale immediately, refreshes in background)
+- returns fresh responses without network I/O
+- sends `If-None-Match` / `If-Modified-Since` when stale and reuses the body on `304`
+- serves stale immediately during `stale-while-revalidate` and refreshes in the background
+- keeps stale entries for `staleRetentionMs` (24h default) past freshness so they can still be revalidated
 
-`cacheTTL` is ignored in HTTP mode — freshness is driven by response headers and stored `CachePolicy` metadata.
+`cacheTTL` is ignored in HTTP mode. Options: `shared`, `cacheHeuristic`, `immutableMinTimeToLive`, `ignoreCargoCult`, `staleRetentionMs`.
 
-### Shared vs private cache
-
-```typescript
-client.httpCache({ shared: false }); // default — `Cache-Control: private` is storable
-client.httpCache({ shared: true });  // proxy-style — `private` responses are not stored
-```
-
-### Vary caveat
-
-One cache key maps to one stored variant. `Vary` is enforced on read — a request whose headers do not match the cached variant misses and may overwrite the prior entry. Use explicit `.cacheKey()` when caching multiple representations of the same URL.
-
-### Policy helpers
-
-Low-level helpers are exported from `@questorylabs/qhttp/http-cache` for custom integrations.
-
-By default only `GET` and `HEAD` are cached. Customize:
-
-```typescript
-client.cacheMethods(['GET', 'HEAD', 'OPTIONS']);
-```
-
-## Default cache engine
-
-When you call `.cache()` without `.cacheEngine()`, QHttp picks:
-
-| Runtime | Engine |
-|---------|--------|
-| Browser (with `localStorage`) | `LocalStorageCacheEngine` |
-| Node / edge | `MemoryCacheEngine` |
-
-Configure the global default:
-
-```typescript
-import { configureDefaultCacheEngine, MemoryCacheEngine } from '@questorylabs/qhttp';
-
-configureDefaultCacheEngine(new MemoryCacheEngine());
-```
+One cache key maps to one stored variant; use explicit `.cacheKey()` when caching several `Vary` representations of one URL.
 
 ## Cache keys
 
-Three strategies:
-
-### 1. Explicit string (with macro support)
+Automatic keys are `METHOD:url?sortedParams:body#vary`. Headers listed in `cacheVary` (default `['authorization']`) are **hashed into the key**, so authenticated responses never cross users that share one engine.
 
 ```typescript
-client.cacheKey('orders:{{userId}}:page-{{page}}');
+client.cacheVary(['authorization', 'accept-language']);
+client.cacheKey('orders:{{userId}}:page-{{page}}');            // explicit, macro-aware
+client.cacheKey((ctx) => `${ctx.method}:${ctx.resolvedUrl}`);  // function
+await client.get('/x', { cacheKey: 'x:one-off' });              // per call
 ```
 
-### 2. Function
+Explicit keys bypass the vary hash; include the user in them yourself.
+
+## Default engine
+
+`MemoryCacheEngine` in every runtime. Persistence across page loads is opt-in:
 
 ```typescript
-client.cacheKey((ctx) => `${ctx.method}:${ctx.resolvedUrl}`);
+import { configureDefaultCacheEngine, LocalStorageCacheEngine } from '@questorylabs/qhttp';
+configureDefaultCacheEngine(new LocalStorageCacheEngine('myapp:'));
 ```
 
-### 3. Automatic (default when no `cacheKey` set)
-
-Derived from method, resolved URL, sorted query params, and body keys — see `buildCacheKeyFromContext`.
-
-```typescript
-import { buildCacheKey, buildCacheKeyFromContext } from '@questorylabs/qhttp';
-```
+Engine failures (quota, network to Redis, corrupt entries) are logged in development and never fail the request.
 
 ## Conditional caching
 
-Gate reads and writes:
-
 ```typescript
 client.cacheWhen((ctx, result) => {
-  // Skip read from cache for ?refresh=1
-  if (ctx.queryParams.refresh) return false;
-  // Only write successful responses
-  if (result && !result.ok) return false;
+  if (ctx.queryParams.refresh) return false;   // read gate (no result)
+  if (result && !result.ok) return false;      // write gate
   return true;
 });
+client.cacheMethods(['GET', 'HEAD', 'OPTIONS']);
 ```
 
-`cacheWhen` is evaluated for reads (no `result`) and writes (with `result`).
-
-## Static cache API
-
-Manage the default engine without a client:
+## Invalidation
 
 ```typescript
-await QHttp.setCache('orders:u2', snapshot, 60_000);
-const value = await QHttp.getCache('orders:u2');
-await QHttp.deleteCache('orders:u2');
-await QHttp.deleteCacheByPrefix('orders:');
+await QHttp.deleteCacheByPrefix('GET:https://api.example.com/orders');
+await QHttp.deleteCache(key);
 await QHttp.clearCache();
-
-// Also on the class:
-QHttp.configureDefaultCacheEngine(engine);
+await QHttp.setCache('warm:key', snapshot, 60_000);
 ```
 
-Use this to pre-warm cache or invalidate after mutations:
-
-```typescript
-await client.post('/orders').setBody({ item: 'x' });
-await QHttp.deleteCacheByPrefix('orders:');
-```
-
-## Custom CacheEngine
-
-Implement the interface for Redis, SQLite, etc.:
+## Custom engine
 
 ```typescript
 import type { CacheEngine } from '@questorylabs/qhttp';
 
-const engine: CacheEngine = {
-  async get(key) { /* ... */ },
-  async set(key, value, ttlMs) { /* ... */ },
-  async delete(key) { /* ... */ },
-  async clear() { /* ... */ },
-  async deleteByPrefix(prefix) { /* ... */ }, // optional
+const redisEngine: CacheEngine = {
+  async get(key) { return JSON.parse((await redis.get(key)) ?? 'null') ?? undefined; },
+  async set(key, value, ttlMs) { await redis.set(key, JSON.stringify(value), ttlMs ? { PX: ttlMs } : {}); },
+  async delete(key) { await redis.del(key); },
+  async clear() { /* flush namespace */ },
+  async deleteByPrefix(prefix) { /* SCAN + DEL */ },
 };
 ```
 
-Stored values are `CacheSnapshot` objects:
-
-```typescript
-interface CacheSnapshot {
-  data: unknown;
-  httpStatus: number;
-  statusText: string;
-  headers: Record<string, string>;
-}
-```
+TTL mode stores `CacheSnapshot` objects (`data`, `httpStatus`, `statusText`, `headers`); HTTP mode stores `HttpCacheEntry` objects with the serialized policy.
 
 ## Cache hooks
 
 ```typescript
-client.hook('preCache', (ctx) => { /* before read */ });
-client.hook('postCache', ({ result, ctx }) => { /* after write */ });
+client.hook('preCache', (ctx) => { /* before read; ctx.state.cacheKey is set */ });
+client.hook('postCache', ({ result, ctx }) => { /* before write */ });
 ```
 
 ## Guidelines
 
-1. **Share one engine** across clients when you want a global cache (e.g. one `MemoryCacheEngine` per process).
-2. **Set explicit keys** for macro-heavy URLs — easier to invalidate than auto keys.
-3. **Binary responses** skip `localStorage` caching (not safely serializable) — use `MemoryCacheEngine` for blobs.
-4. **Serverless** — in-memory cache does not survive cold starts; use an external engine or accept miss-on-cold-start.
-5. **TTL is per entry** — `cacheTTL` on the client applies when writing; static `setCache` accepts TTL per call.
-
-## Performance note
-
-Cache hits avoid network and parsing entirely — useful for hot paths and UI refreshes that repeat the same GET.
+1. **Share one engine** per process for a global cache; pass the instance to each client.
+2. **Keep `authorization` in `cacheVary`** unless the engine is per-user already.
+3. **Binary responses** skip `localStorage`; use memory or a custom engine for blobs.
+4. **Serverless**: in-memory caches do not survive cold starts.
+5. **Pair with `dedupe()`** to collapse concurrent misses into one request.

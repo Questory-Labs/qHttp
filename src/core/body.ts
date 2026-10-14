@@ -1,5 +1,6 @@
 import { QHttpError } from '../errors/qhttp-error.js';
 import type {
+  FetchOptions,
   FinalRequest,
   HttpMethod,
   ProgressEvent,
@@ -8,10 +9,7 @@ import type {
   ResponseType,
 } from './types.js';
 import { hasHeader, setHeader } from '../utils/headers.js';
-import {
-  wrapBodyWithUploadProgress,
-  type SerializedBody,
-} from './upload-progress.js';
+import { wrapBodyWithUploadProgress, type SerializedBody } from './upload-progress.js';
 
 export type { SerializedBody };
 export { wrapBodyWithUploadProgress };
@@ -35,7 +33,7 @@ export function serializeRequestBody(
     return { body };
   }
 
-  if (body instanceof FormData) {
+  if (typeof FormData !== 'undefined' && body instanceof FormData) {
     return { body };
   }
 
@@ -43,7 +41,7 @@ export function serializeRequestBody(
     return { body };
   }
 
-  if (body instanceof Blob) {
+  if (typeof Blob !== 'undefined' && body instanceof Blob) {
     return { body };
   }
 
@@ -71,15 +69,6 @@ export function serializeRequestBody(
 
 export function isReplayableBody(body: RequestBody | undefined): boolean {
   if (body === undefined || body === null) return true;
-  if (typeof body === 'string') return true;
-  if (body instanceof FormData) return true;
-  if (body instanceof URLSearchParams) return true;
-  if (body instanceof Blob) return true;
-  if (body instanceof ArrayBuffer) return true;
-  if (ArrayBuffer.isView(body)) return true;
-  if (typeof body === 'object' && !ArrayBuffer.isView(body) && !(body instanceof ReadableStream)) {
-    return true;
-  }
   if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) {
     return false;
   }
@@ -97,7 +86,7 @@ export async function readResponseWithProgress(
   const totalHeader =
     response.headers instanceof Headers
       ? response.headers.get('content-length')
-      : response.headers['content-length'];
+      : (response.headers['content-length'] ?? response.headers['Content-Length']);
   const total = totalHeader ? Number(totalHeader) : undefined;
 
   const reader = response.body.getReader();
@@ -123,7 +112,7 @@ export async function readResponseWithProgress(
   return combined.buffer;
 }
 
-function readContentType(headers: Headers | Record<string, string>): string {
+export function readContentType(headers: Headers | Record<string, string>): string {
   if (headers && typeof (headers as Headers).get === 'function') {
     const value = (headers as Headers).get('content-type');
     if (value) return value;
@@ -149,7 +138,7 @@ export async function parseResponseBody<T>(
     return response.body as T;
   }
 
-  if (response.status === 204 || response.status === 205) {
+  if (response.status === 204 || response.status === 205 || response.status === 304) {
     return undefined as T;
   }
 
@@ -159,9 +148,12 @@ export async function parseResponseBody<T>(
   }
 
   switch (effectiveType) {
-    case 'json':
+    case 'json': {
+      // Read as text first so empty bodies become `undefined` instead of a parse error.
+      const text = await response.text();
+      if (!text) return undefined as T;
       try {
-        return (await response.json()) as T;
+        return JSON.parse(text) as T;
       } catch (cause) {
         throw new QHttpError('Failed to parse JSON response', {
           code: 'PARSE_ERROR',
@@ -169,6 +161,7 @@ export async function parseResponseBody<T>(
           cause,
         });
       }
+    }
     case 'text':
       return (await response.text()) as T;
     case 'blob':
@@ -180,10 +173,28 @@ export async function parseResponseBody<T>(
   }
 }
 
-function sniffResponseType(contentType: string, status: number): ResponseType {
-  if (status === 204 || status === 205) return 'text';
-  if (contentType.includes('json')) return 'json';
-  if (contentType.startsWith('text/')) return 'text';
+const TEXT_LIKE = [
+  'text/',
+  'application/xml',
+  'application/xhtml+xml',
+  'application/javascript',
+  'application/ecmascript',
+  'application/x-www-form-urlencoded',
+  'application/graphql',
+  'application/sql',
+  'application/yaml',
+  'application/x-yaml',
+  'application/toml',
+  'image/svg+xml',
+];
+
+export function sniffResponseType(contentType: string, status: number): ResponseType {
+  if (status === 204 || status === 205 || status === 304) return 'text';
+  const type = contentType.toLowerCase();
+  if (type.includes('json')) return 'json';
+  if (type.endsWith('+xml') || type.endsWith('+yaml')) return 'text';
+  if (TEXT_LIKE.some((prefix) => type.startsWith(prefix))) return 'text';
+  if (!type) return 'text';
   return 'arrayBuffer';
 }
 
@@ -194,6 +205,14 @@ function parseBufferedBody<T>(
 ): T {
   const effectiveType =
     responseType === 'auto' ? sniffResponseType(contentType, 200) : responseType;
+
+  if (effectiveType === 'arrayBuffer') {
+    return buffer as T;
+  }
+
+  if (effectiveType === 'blob') {
+    return new Blob([buffer], contentType ? { type: contentType } : undefined) as T;
+  }
 
   const text = new TextDecoder().decode(buffer);
 
@@ -209,15 +228,7 @@ function parseBufferedBody<T>(
     }
   }
 
-  if (effectiveType === 'text') {
-    return text as T;
-  }
-
-  if (effectiveType === 'blob') {
-    return new Blob([buffer]) as T;
-  }
-
-  return buffer as T;
+  return text as T;
 }
 
 export function assertProgressCompatible(responseType: ResponseType, hasProgress: boolean): void {
@@ -232,14 +243,18 @@ export function isBinaryResponseType(responseType: ResponseType): boolean {
   return responseType === 'blob' || responseType === 'arrayBuffer' || responseType === 'stream';
 }
 
-export function toFinalRequest(
-  url: string,
-  method: HttpMethod,
-  headers: Map<string, string>,
-  body: RequestBody | undefined,
-  signal?: AbortSignal,
-  onUploadProgress?: (event: ProgressEvent) => void,
-): FinalRequest {
+export interface ToFinalRequestInput {
+  url: string;
+  method: HttpMethod;
+  headers: Map<string, string>;
+  body?: RequestBody;
+  signal?: AbortSignal;
+  onUploadProgress?: (event: ProgressEvent) => void;
+  init?: FetchOptions;
+}
+
+export function toFinalRequest(input: ToFinalRequestInput): FinalRequest {
+  const { url, method, headers, body, signal, onUploadProgress, init } = input;
   const serialized = serializeRequestBody(method, body, headers);
 
   if (onUploadProgress && serialized.body != null) {
@@ -252,6 +267,7 @@ export function toFinalRequest(
         body: wrapped.body,
         signal,
         duplex: wrapped.duplex,
+        init,
       };
     }
   }
@@ -263,5 +279,17 @@ export function toFinalRequest(
     body: serialized.body,
     signal,
     duplex: serialized.duplex,
+    init,
+  };
+}
+
+/** Request summary without serializing the body (cache hits, failures). */
+export function toRequestSummary(input: Omit<ToFinalRequestInput, 'onUploadProgress'>): FinalRequest {
+  return {
+    url: input.url,
+    method: input.method,
+    headers: Object.fromEntries(input.headers),
+    signal: input.signal,
+    init: input.init,
   };
 }

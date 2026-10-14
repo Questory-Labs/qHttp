@@ -4,7 +4,7 @@ import { resolveMacros } from '../utils/url-macros.js';
 
 export function buildCacheKey(
   ctx: RequestContext,
-  config: Pick<QHttpConfig, 'cacheKey' | 'paramsSerializer'>,
+  config: Pick<QHttpConfig, 'cacheKey' | 'paramsSerializer' | 'cacheVary'>,
 ): string {
   if (typeof config.cacheKey === 'function') {
     return config.cacheKey(ctx);
@@ -14,7 +14,10 @@ export function buildCacheKey(
     return resolveMacros(config.cacheKey, ctx.macros, { strict: true });
   }
 
-  return buildCacheKeyFromContext(ctx, config.paramsSerializer);
+  return buildCacheKeyFromContext(ctx, {
+    paramsSerializer: config.paramsSerializer,
+    vary: config.cacheVary,
+  });
 }
 
 export { buildCacheKeyFromContext };
