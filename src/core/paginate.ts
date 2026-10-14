@@ -89,19 +89,38 @@ export function linkHeader<T>(options: { allowCrossOrigin?: boolean } = {}): Nex
   return (result) => {
     const link = result.headers.link ?? result.headers.Link;
     if (!link) return null;
-    const url = parseNextLink(link);
-    if (!url) return null;
-    if (!options.allowCrossOrigin && isAbsoluteUrl(url) && !isSameOrigin(url, result.request.url)) {
+    const target = parseNextLink(link);
+    if (!target) return null;
+    // Resolve against the current request so `?page=2` keeps its path.
+    const resolved = resolveUrl(target, result.request.url);
+    const url = resolved ?? target;
+    if (
+      !options.allowCrossOrigin &&
+      (resolved !== undefined || isAbsoluteUrl(target)) &&
+      !isSameOrigin(url, result.request.url)
+    ) {
       throw new Error(`linkHeader: refusing cross-origin next link ${url}`);
     }
     return { url, params: {} };
   };
 }
 
-function isSameOrigin(link: string, requestUrl: string): boolean {
+function requestBase(requestUrl: string): URL {
   const location = (globalThis as { location?: { href?: string } }).location?.href;
+  return new URL(requestUrl, location);
+}
+
+function resolveUrl(link: string, requestUrl: string): string | undefined {
   try {
-    const request = new URL(requestUrl, location);
+    return new URL(link, requestBase(requestUrl)).href;
+  } catch {
+    return undefined;
+  }
+}
+
+function isSameOrigin(link: string, requestUrl: string): boolean {
+  try {
+    const request = requestBase(requestUrl);
     return new URL(link, request).origin === request.origin;
   } catch {
     return false;

@@ -37,9 +37,21 @@ describe('createSseParser', () => {
     expect(got).toEqual([
       { event: 'tick', data: 'a\nb', id: '7', retry: 250 },
       { event: 'message', data: 'plain', id: '7', retry: undefined },
-      { event: 'message', data: 'trailing', id: '7', retry: undefined },
     ]);
     expect(parser.lastEventId).toBe('7');
+  });
+
+  it('discards an unfinished frame at end without updating the resume id', () => {
+    const got: SseMessage[] = [];
+    const ids: string[] = [];
+    const parser = createSseParser((m) => got.push(m), { onId: (id) => ids.push(id) });
+    parser.push('id: 1\ndata: done\n\n');
+    parser.push('id: 2\ndata: partial\n');
+    parser.end();
+
+    expect(got.map((m) => m.data)).toEqual(['done']);
+    expect(ids).toEqual(['1']);
+    expect(parser.lastEventId).toBe('1');
   });
 
   it('ignores events without data', () => {

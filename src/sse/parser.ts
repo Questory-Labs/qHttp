@@ -9,7 +9,7 @@ export interface SseMessage {
 
 /**
  * Incremental text/event-stream parser (WHATWG EventSource algorithm).
- * Feed chunks with `push`; `end` flushes a trailing event without a blank line.
+ * Feed chunks with `push`; `end` discards a trailing event without a blank line.
  */
 export interface SseParserHooks {
   /** A valid `retry:` field was parsed, whether or not the frame carries data. */
@@ -28,16 +28,23 @@ export function createSseParser(
   let id: string | undefined;
   let retry: number | undefined;
   let sawField = false;
+  // Id as of the last blank-line dispatch; restored when end() drops a frame.
+  let dispatchedId: string | undefined;
 
-  const dispatch = () => {
-    if (id !== undefined && sawField) hooks.onId?.(id);
+  const reset = () => {
     sawField = false;
-    if (data.length > 0) {
-      onMessage({ event: event || 'message', data: data.join('\n'), id, retry });
-    }
     event = '';
     data = [];
     retry = undefined;
+  };
+
+  const dispatch = () => {
+    if (id !== undefined && sawField) hooks.onId?.(id);
+    dispatchedId = id;
+    if (data.length > 0) {
+      onMessage({ event: event || 'message', data: data.join('\n'), id, retry });
+    }
+    reset();
   };
 
   const handleLine = (line: string) => {
@@ -86,11 +93,10 @@ export function createSseParser(
       }
     },
     end() {
-      if (buffer) {
-        handleLine(buffer);
-        buffer = '';
-      }
-      dispatch();
+      // A frame not closed by a blank line is incomplete: discard it.
+      buffer = '';
+      id = dispatchedId;
+      reset();
     },
     get lastEventId() {
       return id;

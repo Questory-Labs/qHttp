@@ -54,6 +54,34 @@ describe('paginate', () => {
     expect(all.map((p) => p.items[0])).toEqual([1, 2]);
   });
 
+  it('resolves relative Link headers against the current request', async () => {
+    const adapter = new MockAdapter().get('/v1/items', (_req, { url }) => {
+      const page = Number(url.searchParams.get('page') ?? '1');
+      return {
+        body: { items: [page] },
+        headers: page < 2 ? { link: '<?page=2>; rel="next"' } : {},
+      };
+    });
+    const client = new QHttp({ adapter, baseUrl: 'https://api.test' });
+    const all = await client.paginate<Page>({ url: '/v1/items', next: linkHeader() }).all();
+    expect(all.map((p) => p.items[0])).toEqual([1, 2]);
+    expect(adapter.calls.map((c) => c.url)).toEqual([
+      'https://api.test/v1/items',
+      'https://api.test/v1/items?page=2',
+    ]);
+  });
+
+  it('rejects cross-origin Link headers', async () => {
+    const adapter = new MockAdapter().get('/a', {
+      body: { items: [1] },
+      headers: { link: '<//evil.test/b>; rel="next"' },
+    });
+    const client = new QHttp({ adapter, baseUrl: 'https://api.test' });
+    await expect(client.paginate<Page>({ url: '/a', next: linkHeader() }).all()).rejects.toThrow(
+      /cross-origin/,
+    );
+  });
+
   it('parses next links among several rels', () => {
     expect(
       parseNextLink('<https://x/prev>; rel="prev", <https://x/next>; rel=next, <https://x/l>; rel="last"'),
