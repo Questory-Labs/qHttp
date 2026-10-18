@@ -41,7 +41,21 @@ Browsers cannot send custom headers; the browser adapter warns in development if
 
 ## Reconnect
 
-Triggered on abnormal close codes (not `1000` / `1001`) and not after `close()`. `retries` counts consecutive attempts and resets when a connection opens. `readyState` stays `'reconnecting'` until the replacement socket opens; `onReconnected` fires then. Listeners on the old socket are detached, so late events from it are ignored.
+Triggered on abnormal close codes (not `1000` / `1001`) and not after `close()`. `retries` counts consecutive attempts and resets when a connection opens. `readyState` stays `'reconnecting'` until the replacement socket opens; `onReconnected` fires then. Listeners on the old socket are detached, so late events from it are ignored. If the adapter throws while reconnecting, the error goes to `onError` and counts as a failed attempt. Calling `connect()` after the socket gave up starts a fresh count.
+
+Some servers accept the socket, send a refusal and close. Resetting on open would then retry at the base delay forever. Pass `resetOn` a predicate to reset only once the server really accepts the connection:
+
+```typescript
+socket.setReconnect({
+  retries: Infinity,
+  backoff: 'exponential',
+  resetOn: (event) => !String(event.data).includes('"error"'),
+});
+```
+
+With a predicate, the count and `onReconnected` wait for the first message after each (re)connect for which it returns `true`. `onOpen` still fires when the socket opens. The default is `resetOn: 'open'`.
+
+`reconnectOn` decides which close codes reconnect. The default skips `1000` and `1001`. A server that restarts may close with either, so pass `reconnectOn: () => true` to reconnect after any close except your own `close()`.
 
 ## Heartbeat
 

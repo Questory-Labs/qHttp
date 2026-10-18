@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+### Added
+
+- **WebSocket `resetOn`.** `setReconnect({ resetOn })` takes `'open'` (default) or a predicate on the incoming message. With a predicate, the attempt counter and `onReconnected` wait for the first accepted message, so a server that accepts and then refuses keeps backing off.
+- **WebSocket `reconnectOn`.** `setReconnect({ reconnectOn })` takes a predicate on the close code. The default still skips `1000` and `1001`; `() => true` reconnects after any close except `close()`.
+
+### Fixed
+
+- A throw from the WebSocket adapter during a reconnect no longer becomes an unhandled rejection that stops reconnecting. It goes to `onError` and counts as a failed attempt.
+- `connect()` after reconnecting gave up starts a fresh attempt count, so the new connection can reconnect again.
+
 ## 0.3.0
 
 Middleware pipeline, per-call options, new entry points and a batch of security

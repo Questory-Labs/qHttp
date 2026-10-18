@@ -1,6 +1,6 @@
 {
   "name": "@questorylabs/qhttp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Fluent, middleware-based HTTP client with caching, retries, rate limiting, WebSocket + SSE clients and React resource hooks",
   "license": "MIT",
   "repository": {
