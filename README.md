@@ -296,16 +296,17 @@ By default only idempotent methods retry, on network errors, timeouts and 408 / 
 ```typescript
 import { MemoryCacheEngine } from '@questorylabs/qhttp';
 
-api.cache().cacheTTL(60_000).cacheEngine(new MemoryCacheEngine({ maxSize: 1_000 }));
+const cache = new MemoryCacheEngine({ maxSize: 1_000 });
+api.cache().cacheTTL(60_000).cacheEngine(cache);
 
 await api.get('/users/u1');                   // network
 await api.get('/users/u1');                   // fromCache: true
 await api.get('/users/u1', { cache: false }); // bypass once
 
-await QHttp.deleteCacheByPrefix('GET:https://api.example.com/users');
+await cache.deleteByPrefix('GET:https://api.example.com/users');
 ```
 
-Cache keys hash the `Authorization` header, so two users sharing one engine never see each other's data. For servers that send `Cache-Control` and `ETag`, switch to `.httpCache()` and get RFC 9111 freshness, conditional revalidation and stale-while-revalidate. [Caching guide](./docs/caching.md)
+Cache keys hash the `Authorization` header, so two users sharing one engine never see each other's data when that header identifies the user. Cookie-authenticated requests are not told apart: give them a per-user `cacheKey` or a separate engine per user. For servers that send `Cache-Control` and `ETag`, switch to `.httpCache()` and get RFC 9111 freshness, conditional revalidation and stale-while-revalidate. [Caching guide](./docs/caching.md)
 
 ### Validate responses with a schema
 
@@ -437,8 +438,13 @@ const stream = new QEventSource('https://api.example.com/stream', {
   .connect();
 
 // or iterate
-for await (const message of new QEventSource(url)) {
-  if (message.event === 'done') break;
+const source = new QEventSource(url);
+try {
+  for await (const message of source) {
+    if (message.event === 'done') break;
+  }
+} finally {
+  source.close();
 }
 ```
 
@@ -544,7 +550,7 @@ It covers the same ground for requests, and adds caching, auth refresh, rate lim
 It is deliberately smaller: ids, loads, freshness, invalidation, push, optimistic actions and a few hooks. If you need devtools, persisters or a large plugin ecosystem, use TanStack Query. If you want something that fits in 8 KB and shares the HTTP client's auth and retries, this is it.
 
 **Does `.cache()` leak data between users?**
-No. The default key hashes the `Authorization` header. If you set an explicit `cacheKey`, include the user yourself.
+Not when the `Authorization` header identifies the user: the default key hashes it. Cookie-authenticated requests are not told apart, so use a per-user `cacheKey` or a separate engine per user. If you set an explicit `cacheKey`, include the user yourself.
 
 **What happens if I call `setRetry` on a client and use `retries` in `useResource`?**
 Both layers retry independently. Keep one owner; the docs recommend the HTTP client.

@@ -150,4 +150,25 @@ describe('QWebSocket lifecycle', () => {
     await vi.advanceTimersByTimeAsync(50);
     expect(adapter.latest.readyState).toBe(3);
   });
+
+  it('returns to closed when the adapter throws on connect, so connect() can be called again', () => {
+    const adapter = new MockWSAdapter();
+    const failure = new Error('blocked');
+    let fail = true;
+    const throwing: WSAdapter = {
+      connect: () => {
+        if (fail) throw failure;
+        return adapter.connect();
+      },
+    };
+    const ws = new QWebSocket('wss://x').setAdapter(throwing);
+
+    expect(() => ws.connect()).toThrow(failure);
+    expect(ws.readyState).toBe('closed');
+
+    fail = false;
+    ws.connect();
+    expect(ws.readyState).toBe('connecting');
+    expect(adapter.sockets).toHaveLength(1);
+  });
 });

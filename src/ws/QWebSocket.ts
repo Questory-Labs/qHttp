@@ -179,7 +179,12 @@ export class QWebSocket {
     this.#manualClose = false;
     this.#reconnectAbort?.abort();
     this.#setState('connecting');
-    this.#openSocket();
+    try {
+      this.#openSocket();
+    } catch (error) {
+      this.#setState('closed');
+      throw error;
+    }
     return this;
   }
 
