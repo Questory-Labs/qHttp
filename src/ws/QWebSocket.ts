@@ -11,6 +11,8 @@ export interface ReconnectOptions {
   maxDelay?: number;
   /** Randomize delay between 50% and 100% of the computed value. */
   jitter?: boolean;
+  resetOn?: 'open' | ((event: WSMessageEvent) => boolean);
+  reconnectOn?: (code: number) => boolean;
 }
 
 export interface HeartbeatOptions {
@@ -66,6 +68,7 @@ export class QWebSocket {
   #reconnectAttempts = 0;
   #wasReconnecting = false;
   #manualClose = false;
+  #awaitingReset = false;
   #state: WSReadyState = 'closed';
   #reconnectAbort?: AbortController;
 
@@ -169,10 +172,19 @@ export class QWebSocket {
 
   connect(): this {
     if (this.#state === 'open' || this.#state === 'connecting') return this;
+    if (this.#state === 'closed') {
+      this.#reconnectAttempts = 0;
+      this.#wasReconnecting = false;
+    }
     this.#manualClose = false;
     this.#reconnectAbort?.abort();
     this.#setState('connecting');
-    this.#openSocket();
+    try {
+      this.#openSocket();
+    } catch (error) {
+      this.#setState('closed');
+      throw error;
+    }
     return this;
   }
 
@@ -196,6 +208,7 @@ export class QWebSocket {
 
   close(code = 1000, reason = ''): void {
     this.#manualClose = true;
+    this.#awaitingReset = false;
     this.#reconnectAbort?.abort();
     this.#clearHeartbeat();
     const bound = this.#bound;
@@ -223,34 +236,29 @@ export class QWebSocket {
 
     const onOpen = () => {
       if (!current()) return;
-      const attempt = this.#reconnectAttempts;
-      const reconnected = this.#wasReconnecting;
-      this.#reconnectAttempts = 0;
-      this.#wasReconnecting = false;
+      const deferred = typeof this.#reconnect?.resetOn === 'function';
+      this.#awaitingReset = deferred;
       this.#setState('open');
       this.#flushQueue();
       this.#startHeartbeat();
       for (const fn of this.#listeners.open) fn();
-      if (reconnected) {
-        for (const fn of this.#listeners.reconnected) fn(attempt);
-      }
+      if (!deferred) this.#resetAttempts();
     };
 
     const onMessage = (event: WSMessageEvent) => {
       if (!current()) return;
       if (this.#isPong(event.data)) this.#resetPongTimer();
+      const resetOn = this.#reconnect?.resetOn;
+      if (this.#awaitingReset && typeof resetOn === 'function' && resetOn(event)) {
+        this.#awaitingReset = false;
+        this.#resetAttempts();
+      }
       for (const fn of this.#listeners.message) fn(event);
     };
 
     const onError = (event: unknown) => {
       if (!current()) return;
-      const error =
-        typeof ErrorEvent !== 'undefined' && event instanceof ErrorEvent
-          ? new Error(event.message)
-          : event instanceof Error
-            ? event
-            : new Error('WebSocket error');
-      for (const fn of this.#listeners.error) fn(error);
+      this.#emitError(event);
     };
 
     const onClose = (event: WSCloseEvent) => {
@@ -274,6 +282,26 @@ export class QWebSocket {
     this.#bind(bound, 'message', onMessage as (event: unknown) => void);
     this.#bind(bound, 'error', onError);
     this.#bind(bound, 'close', onClose as (event: unknown) => void);
+  }
+
+  #resetAttempts(): void {
+    const attempt = this.#reconnectAttempts;
+    const reconnected = this.#wasReconnecting;
+    this.#reconnectAttempts = 0;
+    this.#wasReconnecting = false;
+    if (reconnected) {
+      for (const fn of this.#listeners.reconnected) fn(attempt);
+    }
+  }
+
+  #emitError(event: unknown): void {
+    const error =
+      typeof ErrorEvent !== 'undefined' && event instanceof ErrorEvent
+        ? new Error(event.message)
+        : event instanceof Error
+          ? event
+          : new Error('WebSocket error');
+    for (const fn of this.#listeners.error) fn(error);
   }
 
   #bind(bound: Bound, type: Bound['handlers'][number][0], handler: (event: unknown) => void): void {
@@ -307,7 +335,8 @@ export class QWebSocket {
 
   #shouldReconnect(code: number): boolean {
     if (!this.#reconnect) return false;
-    if (code === 1000 || code === 1001) return false;
+    const reconnectOn = this.#reconnect.reconnectOn ?? ((closed: number) => closed !== 1000 && closed !== 1001);
+    if (!reconnectOn(code)) return false;
     const maxRetries = this.#reconnect.retries ?? 5;
     return this.#reconnectAttempts < maxRetries;
   }
@@ -335,7 +364,13 @@ export class QWebSocket {
     }
     if (this.#reconnectAbort === abort) this.#reconnectAbort = undefined;
     if (!this.#manualClose && this.#state === 'reconnecting') {
-      this.#openSocket();
+      try {
+        this.#openSocket();
+      } catch (error) {
+        this.#emitError(error);
+        if (this.#shouldReconnect(1006)) void this.#scheduleReconnect();
+        else this.#setState('closed');
+      }
     }
   }
 
